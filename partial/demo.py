@@ -3,16 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Event, scoped_session_id, sha256_hex
 from .store import Store
 
-DEMO_BASE = "2026-09-16T09:"
-
-
 def _ts(minute: int, second: int = 0) -> str:
-    return f"{DEMO_BASE}{minute:02d}:{second:02d}.000000Z"
+    base = datetime.now(timezone.utc) - timedelta(minutes=10)
+    ts = base + timedelta(minutes=minute, seconds=second)
+    return ts.isoformat().replace("+00:00", "Z")
 
 
 def _repo(store: Store, name: str) -> str:
@@ -256,11 +256,11 @@ def create_demo_store() -> Store:
             (did, orbit, "code", blob,
              "src/routes/activity.py (synthetic demo)", code,
              "src/routes/activity.py", 1, 4, csha,
-             "2026-09-16T09:10:00.000000Z"))
+             _ts(10)))
         conn.execute(
             "INSERT OR REPLACE INTO repository_indexes(repo_id,"
             "commit_sha,indexed_at) VALUES(?,?,?)",
-            (orbit, csha, "2026-09-16T09:10:00.000000Z"))
+            (orbit, csha, _ts(10)))
         if getattr(store, "fts_ok", True):
             conn.execute(
                 "INSERT INTO memory_fts(id,repo_id,kind,title,text)"

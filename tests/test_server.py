@@ -1518,6 +1518,13 @@ class DemoTests(RepoTestCase):
             {"Origin": f"http://127.0.0.1:{self.port}"})
         self.assertEqual(status, 403)
 
+    def test_demo_dispatch_window(self):
+        status, data, _ = self.req("GET", "/api/dispatch")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["source_ids"]), 3)
+        self.assertIn("cursor pagination", data["markdown"])
+        self.assertFalse(data["truncated"])
+
 
 if __name__ == "__main__":
     unittest.main()

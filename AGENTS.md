@@ -93,9 +93,11 @@ Zero runtime dependencies; Python >= 3.11; stdlib only
   memory tools (search/context/document/graph); no shell execution,
   stdout is protocol-clean.
 - `partial/demo.py` — synthetic demo fixture (temp store, only used by
-  `serve --demo`; read-only API). Indexes its synthetic sessions and
-  checkpoints plus one clearly-labelled synthetic code document so the
-  memory UI is browsable; no network or writes.
+  `serve --demo`; read-only API). Timestamps are generated relative to
+  fixture creation so rolling views such as Dispatch always have data.
+  Indexes its synthetic sessions and checkpoints plus one
+  clearly-labelled synthetic code document so the memory UI is
+  browsable; no network or writes.
 - `partial/static/` — landing page (`index.html`) and the workspace SPA
   (`app.html`, `app.js`, `styles.css`, `favicon.svg`); native ES-module
   JS, no framework/build, textContent-only rendering of untrusted text.
