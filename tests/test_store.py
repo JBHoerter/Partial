@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 
 from partial.models import Event, scoped_session_id
-from partial.store import Store, normalize_remote, sanitize_remote
+from partial.store import (
+    Store, normalize_remote, sanitize_remote, unified_diff_delta,
+)
 
 from helpers import RepoTestCase, init_repo
 
@@ -484,6 +486,218 @@ class StripEventPathsTests(RepoTestCase):
             out["hook"]["transcript_path"], "transcripts/t.jsonl")
         self.assertEqual(
             out["note"], "absolute-looking /etc/hostname in prose")
+
+
+class SummaryFieldTests(RepoTestCase):
+    """Store-level summary fields backing Entire-style
+    repository/session/checkpoint browsing."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store(self.home / "partial.db")
+        self.rid = self.store.register_repo(self.repo)["id"]
+        self.wt = str(Path(self.repo).resolve())
+        self.sid = scoped_session_id(self.rid, "devin", "s1")
+        self.child = scoped_session_id(self.rid, "devin", "s2")
+        self.store.ingest(self.rid, [
+            ev("e1", "s1", "prompt", "2026-01-01T00:00:00Z", "parent"),
+            ev("e2", "s1", "response", "2026-01-01T00:00:01Z", "done"),
+            Event(id="c1", session_id="s2", agent="devin",
+                  kind="prompt", timestamp="2026-01-01T00:00:02Z",
+                  text="child", parent_session_id="s1"),
+        ], worktree=self.wt, branch="main")
+        self.cp_id = "a" * 32
+        self.store.save_checkpoint(
+            self.rid, self.cp_id, "b" * 40, branch="main",
+            message="add a", author="t", files=["a.py"],
+            diff=(
+                "diff --git a/a.py b/a.py\n"
+                "--- a/a.py\n"
+                "+++ b/a.py\n"
+                "@@ -1,2 +1,3 @@\n"
+                " ctx\n"
+                "-old\n"
+                "+new\n"
+                "+newer\n"),
+            links=[(self.sid, "explicit"),
+                   (self.child, "observed-worktree-overlap")],
+            worktree=self.wt, created_at="2026-01-02T00:00:00Z")
+
+    def test_session_summary_fields(self):
+        rows = {s["id"]: s for s in
+                self.store.list_sessions(repo_id=self.rid)}
+        parent = rows[self.sid]
+        self.assertEqual(parent["event_count"], 2)
+        self.assertEqual(parent["checkpoint_count"], 1)
+        self.assertEqual(parent["child_count"], 1)
+        self.assertFalse(parent["is_subagent"])
+        self.assertIsNone(parent["parent_session_id"])
+        child = rows[self.child]
+        self.assertEqual(child["event_count"], 1)
+        self.assertEqual(child["checkpoint_count"], 1)
+        self.assertEqual(child["child_count"], 0)
+        self.assertTrue(child["is_subagent"])
+        self.assertEqual(child["parent_session_id"], self.sid)
+
+    def test_checkpoint_summary_fields(self):
+        c = self.store.list_checkpoints(repo_id=self.rid)[0]
+        self.assertEqual(c["file_count"], 1)
+        self.assertEqual(c["session_count"], 2)
+        self.assertEqual(c["agents"], ["devin"])
+        self.assertEqual(c["additions"], 2)
+        self.assertEqual(c["deletions"], 1)
+        self.assertIsNone(c["ai_percentage"])
+        self.assertIsNone(c["coverage_percentage"])
+        full = self.store.get_checkpoint(self.cp_id)
+        self.assertEqual(full["file_count"], 1)
+        self.assertEqual(full["session_count"], 2)
+        self.assertEqual(full["additions"], 2)
+        self.assertEqual(full["deletions"], 1)
+
+    def test_checkpoint_search(self):
+        self.assertEqual(
+            self.store.list_checkpoints(repo_id=self.rid, q="add a"),
+            self.store.list_checkpoints(repo_id=self.rid))
+        self.assertEqual(
+            self.store.list_checkpoints(q="bbbb")[0]["id"],
+            self.cp_id)
+        self.assertEqual(
+            self.store.list_checkpoints(repo_id=self.rid,
+                                        q="no match"), [])
+        with self.assertRaises(ValueError):
+            self.store.list_checkpoints(q="x" * 501)
+
+    def test_checkpoint_attribution_percentages(self):
+        report = {
+            "version": 1,
+            "method": "position-aware-snapshot-diff-v1",
+            "capture_source": "local-observation",
+            "summary": {
+                "agent_added": 2, "agent_removed": 0,
+                "human_added": 0, "human_removed": 1,
+                "unknown_added": 0, "unknown_removed": 0,
+                "total_changed": 3,
+                "agent_percentage": 66.67,
+                "coverage_percentage": 100.0},
+            "files": [], "excluded": [], "limitations": []}
+        conn = self.store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO checkpoint_attribution(checkpoint_id,"
+                "report) VALUES(?,?)",
+                (self.cp_id, json.dumps(report)))
+            conn.commit()
+        finally:
+            conn.close()
+        c = self.store.list_checkpoints()[0]
+        self.assertEqual(c["ai_percentage"], 66.67)
+        self.assertEqual(c["coverage_percentage"], 100.0)
+        self.assertEqual(
+            self.store.get_checkpoint(self.cp_id)["ai_percentage"],
+            66.67)
+
+    def test_repo_summary(self):
+        r = self.store.repo_summary(self.rid)
+        self.assertNotIn("root", r)
+        self.assertEqual(r["id"], self.rid)
+        self.assertEqual(r["session_count"], 2)
+        self.assertEqual(r["checkpoint_count"], 1)
+        self.assertEqual(r["branch_count"], 1)
+        self.assertEqual(r["agents"], ["devin"])
+        self.assertEqual(r["last_activity"], "2026-01-02T00:00:00Z")
+        self.assertEqual(r["latest_session"]["id"], self.child)
+        self.assertEqual(r["latest_session"]["title"], "child")
+        self.assertEqual(r["latest_checkpoint"]["id"], self.cp_id)
+        self.assertEqual(
+            r["latest_checkpoint"]["commit_sha"], "b" * 40)
+        self.assertEqual(r["latest_checkpoint"]["message"], "add a")
+        self.assertEqual(r["latest_checkpoint"]["author"], "t")
+        self.assertIsNone(r["indexed"])
+        self.assertIsNone(self.store.repo_summary("f" * 64))
+        listed = self.store.list_repo_summaries()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["session_count"], 2)
+        self.assertNotIn("root", listed[0])
+
+    def test_repo_summary_indexed(self):
+        conn = self.store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO repository_indexes(repo_id,commit_sha,"
+                "indexed_at) VALUES(?,?,?)",
+                (self.rid, "c" * 40, "2026-01-03T00:00:00Z"))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            self.store.repo_summary(self.rid)["indexed"],
+            {"commit_sha": "c" * 40,
+             "indexed_at": "2026-01-03T00:00:00Z"})
+
+    def test_unified_diff_delta(self):
+        self.assertEqual(
+            unified_diff_delta(None),
+            {"additions": 0, "deletions": 0})
+        self.assertEqual(
+            unified_diff_delta(""),
+            {"additions": 0, "deletions": 0})
+        self.assertEqual(
+            unified_diff_delta(42),
+            {"additions": 0, "deletions": 0})
+        diff = (
+            "diff --git a/f.py b/f.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/f.py\n"
+            "+++ b/f.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " context\n"
+            "-old line\n"
+            "+new line\n"
+            "+another\n"
+            "\\ No newline at end of file\n")
+        self.assertEqual(
+            unified_diff_delta(diff),
+            {"additions": 2, "deletions": 1})
+
+    def test_checkpoint_token_usage(self):
+        self.store.ingest(self.rid, [
+            Event(id="u1", session_id="s1", agent="devin",
+                  kind="usage", timestamp="2026-01-01T00:00:03Z",
+                  data={"usage_scope": "delta", "usage_id": "u1",
+                        "usage": {"input_tokens": 10,
+                                  "output_tokens": 5}}),
+            Event(id="u2", session_id="s2", agent="devin",
+                  kind="usage", timestamp="2026-01-01T00:00:04Z",
+                  data={"usage_scope": "delta", "usage_id": "u2",
+                        "usage": {"input_tokens": 4,
+                                  "output_tokens": 2,
+                                  "cached_input_tokens": 3}}),
+        ])
+        u = self.store.checkpoint_token_usage(self.cp_id)
+        self.assertEqual(u["input_tokens"], 14)
+        self.assertEqual(u["output_tokens"], 7)
+        self.assertEqual(u["cached_input_tokens"], 3)
+        self.assertIsNone(u["cache_creation_input_tokens"])
+        self.assertEqual(u["sessions"], 2)
+        self.assertEqual(u["events_used"], 2)
+        self.assertTrue(u["complete"])
+        self.assertIsNone(
+            self.store.checkpoint_token_usage("f" * 32))
+
+    def test_checkpoint_token_usage_tolerates_invalid(self):
+        # Negative token counts are rejected by usage_totals; the
+        # aggregate must skip the bad session rather than fail.
+        self.store.ingest(self.rid, [
+            Event(id="u9", session_id="s1", agent="devin",
+                  kind="usage", timestamp="2026-01-01T00:00:03Z",
+                  data={"usage_scope": "delta",
+                        "usage": {"input_tokens": -5}}),
+        ])
+        u = self.store.checkpoint_token_usage(self.cp_id)
+        self.assertIsNotNone(u)
+        self.assertEqual(u["sessions"], 1)
+        self.assertIsNone(u["input_tokens"])
+        self.assertFalse(u["complete"])
 
 
 class RemoteTests(unittest.TestCase):

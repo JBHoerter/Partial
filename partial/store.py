@@ -155,6 +155,8 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_repo_created
     ON checkpoints(repo_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_checkpoint_links_session
     ON checkpoint_links(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent
+    ON sessions(parent_session_id);
 """
 
 MUTATING_TOOLS = {
@@ -563,6 +565,33 @@ def _strip_event_paths(data: dict, roots: list[str]) -> dict:
     return _strip_paths_node(data, roots, False)
 
 
+def unified_diff_delta(diff: object) -> dict:
+    """Count added/removed content lines in a stored unified diff.
+
+    Only ``+``/``-`` content lines are counted; the ``+++``/``---``
+    file headers are excluded.  Stored diffs may be ``None``, empty,
+    or truncated mid-line (checkpoints cap diff size), so this is a
+    pure line-prefix count that never fails and never inspects the
+    filesystem.
+    """
+    added = removed = 0
+    if not isinstance(diff, str) or not diff:
+        return {"additions": 0, "deletions": 0}
+    for line in diff.split("\n"):
+        if line.startswith("+"):
+            if not line.startswith("+++"):
+                added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return {"additions": added, "deletions": removed}
+
+
+_USAGE_FIELDS = (
+    "input_tokens", "output_tokens", "cached_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
 def _bounded_str(v: object, name: str, limit: int = _MAX_STR) -> str | None:
     if v is None:
         return None
@@ -828,36 +857,78 @@ class Store:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
-        sql = "SELECT * FROM sessions WHERE 1=1"
+        # Rows carry dashboard summary columns alongside the raw
+        # session fields: event_count, checkpoint_count (distinct
+        # linked checkpoints), child_count (direct child sessions),
+        # and is_subagent (a parent_session_id is recorded).
+        sql = (
+            "SELECT s.*,"
+            " (SELECT COUNT(*) FROM events e"
+            "  WHERE e.session_id=s.id) AS event_count,"
+            " (SELECT COUNT(DISTINCT l.checkpoint_id)"
+            "  FROM checkpoint_links l"
+            "  WHERE l.session_id=s.id) AS checkpoint_count,"
+            " (SELECT COUNT(*) FROM sessions c"
+            "  WHERE c.parent_session_id=s.id) AS child_count"
+            " FROM sessions s WHERE 1=1"
+        )
         params: list = []
         if repo_id:
-            sql += " AND repo_id=?"
+            sql += " AND s.repo_id=?"
             params.append(repo_id)
         if agent:
-            sql += " AND agent=?"
+            sql += " AND s.agent=?"
             params.append(agent)
         if agent and agent not in AGENTS:
             raise ValueError(f"unknown agent: {agent}")
         if branch:
-            sql += " AND branch=?"
+            sql += " AND s.branch=?"
             params.append(branch)
         if q:
             if len(q) > 500:
                 raise ValueError("search query too long (max 500)")
             like = f"%{_like_esc(q)}%"
-            sql += (" AND (title LIKE ? ESCAPE '\\'"
-                    " OR native_id LIKE ? ESCAPE '\\'"
-                    " OR branch LIKE ? ESCAPE '\\'"
+            sql += (" AND (s.title LIKE ? ESCAPE '\\'"
+                    " OR s.native_id LIKE ? ESCAPE '\\'"
+                    " OR s.branch LIKE ? ESCAPE '\\'"
                     " OR EXISTS(SELECT 1 FROM events e"
-                    " WHERE e.session_id=sessions.id"
+                    " WHERE e.session_id=s.id"
                     " AND (e.text LIKE ? ESCAPE '\\'"
                     " OR e.data LIKE ? ESCAPE '\\')))")
             params += [like, like, like, like, like]
-        sql += " ORDER BY COALESCE(updated_at,'') DESC LIMIT ? OFFSET ?"
+        sql += (" ORDER BY COALESCE(s.updated_at,'') DESC"
+                " LIMIT ? OFFSET ?")
         params += [int(limit), int(offset)]
         conn = self._connect()
         try:
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+        for r in rows:
+            r["is_subagent"] = r.get("parent_session_id") is not None
+        return rows
+
+    def session_rollup(self, session_id: str) -> dict:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT"
+                " (SELECT COUNT(*) FROM events e"
+                "  WHERE e.session_id=s.id) AS event_count,"
+                " (SELECT COUNT(DISTINCT l.checkpoint_id)"
+                "  FROM checkpoint_links l"
+                "  WHERE l.session_id=s.id) AS checkpoint_count,"
+                " (SELECT COUNT(*) FROM sessions c"
+                "  WHERE c.parent_session_id=s.id) AS child_count"
+                " FROM sessions s WHERE s.id=?",
+                (session_id,)).fetchone()
+            if row is None:
+                return {}
+            return {
+                "event_count": row["event_count"],
+                "checkpoint_count": row["checkpoint_count"],
+                "child_count": row["child_count"],
+            }
         finally:
             conn.close()
 
@@ -935,14 +1006,123 @@ class Store:
         finally:
             conn.close()
 
+    @staticmethod
+    def _repo_stats(conn, repo_id: str) -> dict:
+        """Dashboard summary fields for one repository.
+
+        Aggregates session/checkpoint counts, distinct agents and
+        branches, last recorded activity, the latest session and
+        checkpoint, and memory index metadata — without ever reading
+        the repository ``root`` path or other local-only fields.
+        """
+        srow = conn.execute(
+            "SELECT COUNT(*) AS c,"
+            " MAX(COALESCE(updated_at, started_at)) AS last"
+            " FROM sessions WHERE repo_id=?", (repo_id,)).fetchone()
+        crow = conn.execute(
+            "SELECT COUNT(*) AS c, MAX(created_at) AS last"
+            " FROM checkpoints WHERE repo_id=?", (repo_id,)).fetchone()
+        agents = [r["agent"] for r in conn.execute(
+            "SELECT DISTINCT agent FROM sessions WHERE repo_id=?"
+            " ORDER BY agent", (repo_id,))]
+        branch_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM ("
+            " SELECT branch FROM checkpoints WHERE repo_id=?"
+            "  AND branch IS NOT NULL"
+            " UNION"
+            " SELECT branch FROM sessions WHERE repo_id=?"
+            "  AND branch IS NOT NULL)",
+            (repo_id, repo_id)).fetchone()["c"]
+        latest_s = conn.execute(
+            "SELECT id,native_id,agent,title,status,started_at,"
+            "updated_at FROM sessions WHERE repo_id=?"
+            " ORDER BY COALESCE(updated_at, started_at, '') DESC, id"
+            " LIMIT 1", (repo_id,)).fetchone()
+        latest_c = conn.execute(
+            "SELECT id,commit_sha,message,branch,author,created_at"
+            " FROM checkpoints WHERE repo_id=?"
+            " ORDER BY created_at DESC, id LIMIT 1",
+            (repo_id,)).fetchone()
+        idx = conn.execute(
+            "SELECT commit_sha,indexed_at FROM repository_indexes"
+            " WHERE repo_id=?", (repo_id,)).fetchone()
+        activity = [x for x in (srow["last"], crow["last"]) if x]
+        return {
+            "session_count": srow["c"],
+            "checkpoint_count": crow["c"],
+            "branch_count": branch_count,
+            "agents": agents,
+            "last_activity": max(activity) if activity else None,
+            "latest_session": {
+                "id": latest_s["id"],
+                "native_id": latest_s["native_id"],
+                "agent": latest_s["agent"],
+                "title": latest_s["title"],
+                "status": latest_s["status"],
+                "started_at": latest_s["started_at"],
+                "updated_at": latest_s["updated_at"],
+            } if latest_s is not None else None,
+            "latest_checkpoint": {
+                "id": latest_c["id"],
+                "commit_sha": latest_c["commit_sha"],
+                "message": latest_c["message"],
+                "branch": latest_c["branch"],
+                "author": latest_c["author"],
+                "created_at": latest_c["created_at"],
+            } if latest_c is not None else None,
+            "indexed": {
+                "commit_sha": idx["commit_sha"],
+                "indexed_at": idx["indexed_at"],
+            } if idx is not None else None,
+        }
+
+    def repo_summary(self, repo_id: str) -> dict | None:
+        """Repository row (safe columns only) plus dashboard stats."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT id,name,remote,created_at FROM repositories"
+                " WHERE id=?", (repo_id,)).fetchone()
+            if row is None:
+                return None
+            return {**dict(row), **self._repo_stats(conn, repo_id)}
+        finally:
+            conn.close()
+
+    def list_repo_summaries(self) -> list[dict]:
+        """All repositories with dashboard stats, in one connection."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id,name,remote,created_at FROM repositories"
+                " ORDER BY created_at,id").fetchall()
+            return [
+                {**dict(r), **self._repo_stats(conn, r["id"])}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
     def child_sessions(self, session_id: str) -> list[dict]:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM sessions WHERE parent_session_id=?"
-                " ORDER BY updated_at", (session_id,),
+                "SELECT s.*,"
+                " (SELECT COUNT(*) FROM events e"
+                "  WHERE e.session_id=s.id) AS event_count,"
+                " (SELECT COUNT(DISTINCT l.checkpoint_id)"
+                "  FROM checkpoint_links l"
+                "  WHERE l.session_id=s.id) AS checkpoint_count,"
+                " (SELECT COUNT(*) FROM sessions c"
+                "  WHERE c.parent_session_id=s.id) AS child_count"
+                " FROM sessions s WHERE s.parent_session_id=?"
+                " ORDER BY s.updated_at", (session_id,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            out = [dict(r) for r in rows]
+            for r in out:
+                r["is_subagent"] = \
+                    r.get("parent_session_id") is not None
+            return out
         finally:
             conn.close()
 
@@ -950,11 +1130,23 @@ class Store:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT s.* FROM sessions s JOIN checkpoint_links l"
+                "SELECT s.*,"
+                " (SELECT COUNT(*) FROM events e"
+                "  WHERE e.session_id=s.id) AS event_count,"
+                " (SELECT COUNT(DISTINCT l2.checkpoint_id)"
+                "  FROM checkpoint_links l2"
+                "  WHERE l2.session_id=s.id) AS checkpoint_count,"
+                " (SELECT COUNT(*) FROM sessions c"
+                "  WHERE c.parent_session_id=s.id) AS child_count"
+                " FROM sessions s JOIN checkpoint_links l"
                 " ON l.session_id=s.id WHERE l.checkpoint_id=?"
                 " ORDER BY s.updated_at", (checkpoint_id,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            out = [dict(r) for r in rows]
+            for r in out:
+                r["is_subagent"] = \
+                    r.get("parent_session_id") is not None
+            return out
         finally:
             conn.close()
 
@@ -1404,6 +1596,7 @@ class Store:
         *,
         repo_id: str | None = None,
         branch: str | None = None,
+        q: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -1415,16 +1608,25 @@ class Store:
         if branch:
             sql += " AND branch=?"
             params.append(branch)
+        if q:
+            if len(q) > 500:
+                raise ValueError("search query too long (max 500)")
+            like = f"%{_like_esc(q)}%"
+            sql += (" AND (message LIKE ? ESCAPE '\\'"
+                    " OR commit_sha LIKE ? ESCAPE '\\'"
+                    " OR branch LIKE ? ESCAPE '\\')")
+            params += [like, like, like]
         sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params += [int(limit), int(offset)]
         conn = self._connect()
         try:
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            for r in rows:
+                r["files"] = json.loads(r["files"])
+                r["session_ids"] = json.loads(r["session_ids"])
+            self._enrich_checkpoints(conn, rows)
         finally:
             conn.close()
-        for r in rows:
-            r["files"] = json.loads(r["files"])
-            r["session_ids"] = json.loads(r["session_ids"])
         return rows
 
     def _checkpoint_links(self, conn, checkpoint_id: str) -> list[dict]:
@@ -1434,6 +1636,62 @@ class Store:
             (checkpoint_id,),
         ).fetchall()
         return [dict(l) for l in rows]
+
+    @staticmethod
+    def _enrich_checkpoints(conn, rows: list[dict]) -> None:
+        """Attach computed summary fields to checkpoint rows in place.
+
+        Each row gains ``file_count``, ``session_count`` (distinct
+        sessions named by ``session_ids`` or ``checkpoint_links``),
+        ``agents`` (distinct agents of those sessions), ``additions``/
+        ``deletions`` counted from the stored unified diff, and
+        ``ai_percentage``/``coverage_percentage`` from the recorded
+        attribution report when one exists (``None`` otherwise).
+        Expects ``files`` and ``session_ids`` already JSON-decoded.
+        """
+        if not rows:
+            return
+        ids = [r["id"] for r in rows]
+        marks = ",".join("?" for _ in ids)
+        linked: dict[str, set] = {
+            r["id"]: set(r.get("session_ids") or []) for r in rows}
+        for l in conn.execute(
+                "SELECT checkpoint_id,session_id FROM checkpoint_links"
+                f" WHERE checkpoint_id IN ({marks})", ids):
+            linked[l["checkpoint_id"]].add(l["session_id"])
+        sids = set().union(*linked.values()) if linked else set()
+        agent_by_sid: dict[str, str] = {}
+        if sids:
+            smarks = ",".join("?" for _ in sids)
+            for s in conn.execute(
+                    "SELECT id,agent FROM sessions"
+                    f" WHERE id IN ({smarks})", sorted(sids)):
+                agent_by_sid[s["id"]] = s["agent"]
+        summaries: dict[str, dict] = {}
+        for a in conn.execute(
+                "SELECT checkpoint_id,report FROM checkpoint_attribution"
+                f" WHERE checkpoint_id IN ({marks})", ids):
+            try:
+                rep = json.loads(a["report"])
+            except (ValueError, TypeError):
+                continue
+            summ = rep.get("summary") if isinstance(rep, dict) else None
+            if isinstance(summ, dict):
+                summaries[a["checkpoint_id"]] = summ
+        for r in rows:
+            r["file_count"] = len(r.get("files") or [])
+            linked_sids = {
+                s for s in (linked.get(r["id"]) or set())
+                if s in agent_by_sid}
+            r["session_count"] = len(linked_sids)
+            r["agents"] = sorted({
+                agent_by_sid[s] for s in linked_sids})
+            delta = unified_diff_delta(r.get("diff"))
+            r["additions"] = delta["additions"]
+            r["deletions"] = delta["deletions"]
+            summ = summaries.get(r["id"]) or {}
+            r["ai_percentage"] = summ.get("agent_percentage")
+            r["coverage_percentage"] = summ.get("coverage_percentage")
 
     def get_checkpoint(self, checkpoint_id: str) -> dict | None:
         conn = self._connect()
@@ -1447,7 +1705,83 @@ class Store:
             r["files"] = json.loads(r["files"])
             r["session_ids"] = json.loads(r["session_ids"])
             r["links"] = self._checkpoint_links(conn, checkpoint_id)
+            self._enrich_checkpoints(conn, [r])
             return r
+        finally:
+            conn.close()
+
+    def checkpoint_token_usage(self, checkpoint_id: str) -> dict | None:
+        """Aggregate token usage across unique linked sessions.
+
+        Per-session totals come from ``brain_contract.usage_totals``
+        over each session's recorded ``usage`` events; the four token
+        fields are summed across sessions that reported them.
+        Missing, malformed, or invalid usage data is skipped so a
+        detail read never fails on accounting.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT session_ids FROM checkpoints WHERE id=?",
+                (checkpoint_id,)).fetchone()
+            if row is None:
+                return None
+            sids = set(json.loads(row["session_ids"]))
+            sids.update(
+                r["session_id"] for r in conn.execute(
+                    "SELECT session_id FROM checkpoint_links"
+                    " WHERE checkpoint_id=?", (checkpoint_id,)))
+            if sids:
+                marks = ",".join("?" for _ in sids)
+                sids = {r["id"] for r in conn.execute(
+                    f"SELECT id FROM sessions WHERE id IN ({marks})",
+                    sorted(sids))}
+            sums = {f: 0 for f in _USAGE_FIELDS}
+            have = {f: False for f in _USAGE_FIELDS}
+            sessions_used = events_used = unclassified = 0
+            complete = bool(sids)
+            for sid in sorted(sids):
+                events = []
+                for e in conn.execute(
+                        "SELECT id,kind,timestamp,data FROM events"
+                        " WHERE session_id=? AND kind='usage'"
+                        " ORDER BY timestamp,rowid", (sid,)):
+                    try:
+                        data = json.loads(e["data"])
+                    except (ValueError, TypeError):
+                        data = {}
+                    events.append({
+                        "id": e["id"], "kind": e["kind"],
+                        "timestamp": e["timestamp"],
+                        "data": data if isinstance(data, dict) else {}})
+                try:
+                    totals = brain_contract.usage_totals(events)
+                except Exception:
+                    # Invalid recorded usage must not turn a
+                    # checkpoint read into a failure.
+                    continue
+                sessions_used += 1
+                events_used += int(totals.get("events_used") or 0)
+                unclassified += int(
+                    totals.get("unclassified_events") or 0)
+                complete = complete and bool(totals.get("complete"))
+                for f in _USAGE_FIELDS:
+                    v = totals.get(f)
+                    if type(v) is int and v >= 0:
+                        sums[f] += v
+                        have[f] = True
+            out = {
+                f: (sums[f] if have[f] else None)
+                for f in _USAGE_FIELDS}
+            out["basis"] = "session-sums"
+            out["sessions"] = sessions_used
+            out["events_used"] = events_used
+            out["unclassified_events"] = unclassified
+            out["complete"] = bool(
+                sessions_used and sessions_used == len(sids)
+                and complete
+                and have["input_tokens"] and have["output_tokens"])
+            return out
         finally:
             conn.close()
 
@@ -1530,6 +1864,7 @@ class Store:
                 r["files"] = json.loads(r["files"])
                 r["session_ids"] = json.loads(r["session_ids"])
                 r["links"] = self._checkpoint_links(conn, checkpoint_id)
+                self._enrich_checkpoints(conn, [r])
                 return r
         finally:
             conn.close()

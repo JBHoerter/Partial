@@ -256,6 +256,24 @@ Claude uses the same group shape nested under a `"hooks"` key inside the
 generated `.devin/partial/claude-settings.json`. Merge/remove is by exact
 owned command equality only; foreign hooks are never touched.
 
+### Devin sub-agents and attribution
+
+Devin hook payloads and ATIF exports can identify work below the top-level
+session. A hook payload with `parent_session_id` creates a child session
+row scoped to the same repository and agent. A Devin ATIF import walks
+`subagent_trajectories` recursively (bounded at depth 16) and materializes
+each trajectory as a `devin` child session with the trajectory id in its
+native id. Child sessions keep their own prompts, tool calls, model,
+timestamps, and usage events, and are shown as `sub-agent` rows under the
+parent session and in a checkpoint's Sessions tab.
+
+Attribution stays evidence-based: checkpoint line reports and the diff
+badges carry the scoped session id that supplied the before/after file
+evidence. The dashboard resolves that id to the agent/model/session title
+when the session is linked to the checkpoint. If a sub-agent only reviewed
+or searched without changing files, it appears as session context rather
+than as AI-authored lines.
+
 ## Source references
 
 - Entire (MIT): https://github.com/entireio/cli pinned at

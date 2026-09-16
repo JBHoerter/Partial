@@ -513,11 +513,188 @@ class ApiTests(ServerCase):
         self.assertEqual(len(data["items"]), 1)
         self.assertNotIn("diff", data["items"][0])
         status, data, _, _ = self.req(
+            "GET", "/api/checkpoints?q=no%20match",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["items"], [])
+        status, data, _, _ = self.req(
             "GET", f"/api/checkpoints/{self.checkpoint_id}",
             headers=self.bearer())
         self.assertEqual(status, 200)
         self.assertIn("diff", data["checkpoint"])
         self.assertEqual(data["sessions"][0]["id"], self.session_id)
+        self.assertEqual(data["sessions"][0]["event_count"], 4)
+        self.assertEqual(
+            data["sessions"][0]["checkpoint_count"], 1)
+        self.assertFalse(data["sessions"][0]["is_subagent"])
+
+    def test_repos_summary_fields(self):
+        status, data, _, _ = self.req(
+            "GET", "/api/repos", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["items"]), 1)
+        item = data["items"][0]
+        self.assertNotIn("root", item)
+        self.assertEqual(item["id"], self.repo_id)
+        self.assertEqual(item["session_count"], 1)
+        self.assertEqual(item["checkpoint_count"], 1)
+        self.assertEqual(item["branch_count"], 1)
+        self.assertEqual(item["agents"], ["devin"])
+        self.assertTrue(item["last_activity"])
+        self.assertEqual(
+            item["latest_session"]["id"], self.session_id)
+        self.assertEqual(item["latest_session"]["title"],
+                         "add 100% coverage for tokens_limit")
+        self.assertEqual(
+            item["latest_checkpoint"]["id"], self.checkpoint_id)
+        self.assertTrue(item["latest_checkpoint"]["commit_sha"])
+        self.assertIsNone(item["indexed"])
+        status, data, _, _ = self.req(
+            "GET", f"/api/repos/{self.repo_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertNotIn("root", data["repository"])
+        stats = data["stats"]
+        self.assertEqual(stats["session_count"], 1)
+        self.assertEqual(stats["checkpoint_count"], 1)
+        self.assertEqual(stats["branch_count"], 1)
+        self.assertEqual(stats["agents"], ["devin"])
+        self.assertTrue(stats["last_activity"])
+        self.assertEqual(
+            stats["latest_session"]["id"], self.session_id)
+        self.assertEqual(
+            stats["latest_checkpoint"]["id"], self.checkpoint_id)
+        self.assertIsNone(stats["indexed"])
+        conn = self.store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO repository_indexes(repo_id,commit_sha,"
+                "indexed_at) VALUES(?,?,?)",
+                (self.repo_id, "c" * 40, "2026-01-03T00:00:00Z"))
+            conn.commit()
+        finally:
+            conn.close()
+        status, data, _, _ = self.req(
+            "GET", f"/api/repos/{self.repo_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["stats"]["indexed"], {
+            "commit_sha": "c" * 40,
+            "indexed_at": "2026-01-03T00:00:00Z"})
+
+    def test_sessions_list_summary_fields(self):
+        status, data, _, _ = self.req(
+            "GET", "/api/sessions", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["items"]), 1)
+        s = data["items"][0]
+        self.assertEqual(s["event_count"], 4)
+        self.assertEqual(s["checkpoint_count"], 1)
+        self.assertEqual(s["child_count"], 0)
+        self.assertFalse(s["is_subagent"])
+        self.assertIsNone(s["parent_session_id"])
+        # A session recorded with a parent surfaces as a sub-agent
+        # row and bumps the parent's child count.
+        self.store.ingest(self.repo_id, [
+            Event(id="k1", session_id="child-1", agent="devin",
+                  kind="prompt",
+                  timestamp="2026-09-16T09:05:00.000000Z",
+                  text="child task",
+                  parent_session_id=self.sid_native),
+        ], worktree=str(self.repo))
+        status, data, _, _ = self.req(
+            "GET", "/api/sessions?limit=10", headers=self.bearer())
+        self.assertEqual(status, 200)
+        by_id = {x["id"]: x for x in data["items"]}
+        child_id = scoped_session_id(
+            self.repo_id, "devin", "child-1")
+        self.assertTrue(by_id[child_id]["is_subagent"])
+        self.assertEqual(
+            by_id[child_id]["parent_session_id"], self.session_id)
+        self.assertEqual(by_id[child_id]["event_count"], 1)
+        self.assertEqual(by_id[child_id]["child_count"], 0)
+        self.assertEqual(
+            by_id[self.session_id]["child_count"], 1)
+        status, data, _, _ = self.req(
+            "GET", f"/api/sessions/{self.session_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["session"]["event_count"], 4)
+        self.assertEqual(data["session"]["checkpoint_count"], 1)
+        self.assertEqual(data["session"]["child_count"], 1)
+        self.assertFalse(data["session"]["is_subagent"])
+        child = data["children"][0]
+        self.assertEqual(child["id"], child_id)
+        self.assertTrue(child["is_subagent"])
+        self.assertEqual(child["event_count"], 1)
+        self.assertEqual(child["checkpoint_count"], 0)
+
+    def test_checkpoints_summary_fields(self):
+        status, data, _, _ = self.req(
+            "GET", "/api/checkpoints", headers=self.bearer())
+        self.assertEqual(status, 200)
+        c = data["items"][0]
+        self.assertNotIn("diff", c)
+        self.assertNotIn("files", c)
+        self.assertEqual(c["file_count"], 1)
+        self.assertEqual(c["session_count"], 1)
+        self.assertEqual(c["agents"], ["devin"])
+        self.assertEqual(c["additions"], 1)
+        self.assertEqual(c["deletions"], 0)
+        # create_checkpoint records an attribution report; every line
+        # is unobserved here, so the AI share and coverage are 0%.
+        self.assertEqual(c["ai_percentage"], 0.0)
+        self.assertEqual(c["coverage_percentage"], 0.0)
+        status, data, _, _ = self.req(
+            "GET", f"/api/checkpoints/{self.checkpoint_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        cp = data["checkpoint"]
+        self.assertEqual(cp["file_count"], 1)
+        self.assertEqual(cp["session_count"], 1)
+        self.assertEqual(cp["agents"], ["devin"])
+        self.assertEqual(cp["additions"], 1)
+        self.assertEqual(cp["deletions"], 0)
+        self.assertEqual(cp["ai_percentage"], 0.0)
+        self.assertIn("token_usage", cp)
+        self.assertIsNone(cp["token_usage"]["input_tokens"])
+        self.assertEqual(cp["token_usage"]["sessions"], 1)
+
+    def test_checkpoint_detail_token_usage_aggregates(self):
+        self.store.ingest(self.repo_id, [
+            Event(id="u1", session_id=self.sid_native, agent="devin",
+                  kind="usage",
+                  timestamp="2026-09-16T09:00:04.000000Z",
+                  data={"usage_scope": "delta", "usage_id": "u1",
+                        "usage": {"input_tokens": 12,
+                                  "output_tokens": 4}}),
+        ])
+        status, data, _, _ = self.req(
+            "GET", f"/api/checkpoints/{self.checkpoint_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200, data)
+        u = data["checkpoint"]["token_usage"]
+        self.assertEqual(u["input_tokens"], 12)
+        self.assertEqual(u["output_tokens"], 4)
+        self.assertEqual(u["sessions"], 1)
+        self.assertTrue(u["complete"])
+        # A malformed usage record drops that session from the
+        # aggregate but must not turn the detail read into a 500.
+        self.store.ingest(self.repo_id, [
+            Event(id="u9", session_id=self.sid_native, agent="devin",
+                  kind="usage",
+                  timestamp="2026-09-16T09:00:05.000000Z",
+                  data={"usage_scope": "delta",
+                        "usage": {"input_tokens": -1}}),
+        ])
+        status, data, _, _ = self.req(
+            "GET", f"/api/checkpoints/{self.checkpoint_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200, data)
+        u = data["checkpoint"]["token_usage"]
+        self.assertIsNone(u["input_tokens"])
+        self.assertEqual(u["sessions"], 0)
+        self.assertFalse(u["complete"])
 
     def test_search(self):
         status, data, _, _ = self.req(
@@ -822,7 +999,7 @@ class MemoryApiTests(ServerCase):
              "X-Partial-Workspace": ws2})
         self.assertEqual(status, 404)
         status, data, _, _ = self.req(
-            "GET", f"/api/workflows/{"0" * 64}",
+            "GET", f"/api/workflows/{'0' * 64}",
             headers={"Cookie": cookie, "X-Partial-Workspace": ws2})
         self.assertEqual(status, 404)
 
@@ -1327,11 +1504,11 @@ class DemoTests(RepoTestCase):
         status, data, _ = self.req("GET", "/api/overview")
         self.assertEqual(status, 200)
         self.assertEqual(data["repositories"], 2)
-        self.assertEqual(data["sessions"], 4)
+        self.assertEqual(data["sessions"], 5)
         self.assertEqual(data["checkpoints"], 3)
         status, data, _ = self.req("GET", "/api/sessions")
         self.assertEqual(status, 200)
-        self.assertEqual(len(data["items"]), 4)
+        self.assertEqual(len(data["items"]), 5)
         status, _, _ = self.req(
             "POST", "/api/bundles", {},
             {"Origin": f"http://127.0.0.1:{self.port}"})

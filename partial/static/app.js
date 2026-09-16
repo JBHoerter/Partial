@@ -304,6 +304,83 @@ function statusPill(status) {
   return el("span", `pill status-${status}`, status || "unknown");
 }
 
+function plural(n, singular, pluralWord) {
+  const word = n === 1 ? singular : (pluralWord || `${singular}s`);
+  return `${n == null ? 0 : n} ${word}`;
+}
+
+function agentList(agents, fallback) {
+  const names = Array.isArray(agents) ? agents.filter(Boolean)
+    : (fallback ? [fallback] : []);
+  const box = el("span", "agent-list");
+  if (!names.length) {
+    box.appendChild(el("span", "pill", "—"));
+    return box;
+  }
+  for (const a of names) box.appendChild(agentPill(a));
+  return box;
+}
+
+function authorCell(author) {
+  const name = author || "—";
+  const initials = name === "—" ? "?" : name.split(/\s+/)
+    .map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+  const badge = el("span", "avatar", initials);
+  badge.title = name;
+  const cell = el("span", "author-cell");
+  cell.append(badge, document.createTextNode(name));
+  return cell;
+}
+
+function sessionRole(s) {
+  return (s.is_subagent || s.parent_session_id) ? "sub-agent" : "session";
+}
+
+function sessionTitleCell(s) {
+  const box = el("div", "cell-main");
+  const a = sessionLink(s);
+  a.classList.add("cell-title");
+  box.appendChild(a);
+  const sub = [];
+  if (s.is_subagent || s.parent_session_id)
+    sub.push("sub-agent session");
+  if (s.model) sub.push(s.model);
+  if (s.native_id) sub.push(`native ${s.native_id}`);
+  if (sub.length) box.appendChild(el("div", "cell-sub", sub.join(" · ")));
+  return box;
+}
+
+function tokenLine(usage) {
+  if (!usage) return "Not reported";
+  const parts = [];
+  if (usage.input_tokens != null) parts.push(`in ${usage.input_tokens}`);
+  if (usage.output_tokens != null) parts.push(`out ${usage.output_tokens}`);
+  if (usage.cached_input_tokens != null)
+    parts.push(`cached ${usage.cached_input_tokens}`);
+  if (usage.cache_creation_input_tokens != null)
+    parts.push(`cache write ${usage.cache_creation_input_tokens}`);
+  if (!parts.length) return "Not reported";
+  return `${parts.join(" · ")}${usage.complete ? "" : " · partial"}`;
+}
+
+function diffDelta(c) {
+  const box = el("span", "diff-delta mono");
+  box.appendChild(el("span", "d-add", `+${c.additions || 0}`));
+  box.appendChild(document.createTextNode(" / "));
+  box.appendChild(el("span", "d-del", `−${c.deletions || 0}`));
+  return box;
+}
+
+function aiCell(c) {
+  if (c.ai_percentage == null) return "—";
+  const box = el("div", "cell-main");
+  box.appendChild(el("span", "cell-title", `${c.ai_percentage}% AI`));
+  if (c.coverage_percentage != null)
+    box.appendChild(el("div", "cell-sub",
+      `${c.coverage_percentage}% covered`));
+  return box;
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -459,10 +536,10 @@ async function vOverview(root, signal) {
   sp.appendChild(el("h2", null, "Recent sessions"));
   if (sessions.items.length) {
     sp.appendChild(table(
-      ["Session", "Agent", "Status", "Updated"],
+      ["Session", "Agent", "Role", "Status", "Updated"],
       sessions.items.map((s) => [
-        sessionLink(s), agentPill(s.agent), statusPill(s.status),
-        fmtDate(s.updated_at),
+        sessionTitleCell(s), agentPill(s.agent), sessionRole(s),
+        statusPill(s.status), fmtDate(s.updated_at),
       ])));
   } else {
     sp.appendChild(emptySetup());
@@ -473,10 +550,10 @@ async function vOverview(root, signal) {
   cp.appendChild(el("h2", null, "Recent checkpoints"));
   if (cps.items.length) {
     cp.appendChild(table(
-      ["Commit", "Message", "Branch", "Captured"],
+      ["Commit", "Message", "Agents", "AI", "Branch", "Captured"],
       cps.items.map((c) => [
-        checkpointLink(c), c.message || "—", c.branch || "—",
-        fmtDate(c.created_at),
+        checkpointLink(c), c.message || "—", agentList(c.agents),
+        aiCell(c), c.branch || "—", fmtDate(c.created_at),
       ])));
   } else {
     cp.appendChild(el("div", "empty",
@@ -517,12 +594,24 @@ async function vRepos(root, signal) {
     p.appendChild(emptySetup());
   } else {
     p.appendChild(table(
-      ["Name", "Remote", "Registered"],
+      ["Repository", "Agents", "Sessions", "Checkpoints", "Branches",
+       "Last activity"],
       d.items.map((r) => {
-        const a = el("a", null, r.name);
+        const main = el("div", "cell-main");
+        const a = el("a", "cell-title", r.name);
         a.href = `#/repos/${r.id}`;
-        return [a, el("span", "mono", r.remote || "—"),
-                fmtDate(r.created_at)];
+        main.appendChild(a);
+        const latest = r.latest_checkpoint && r.latest_checkpoint.message
+          ? `latest ${r.latest_checkpoint.message}`
+          : (r.latest_session && r.latest_session.title
+            ? `latest ${r.latest_session.title}`
+            : (r.remote || "local only"));
+        main.appendChild(el("div", "cell-sub", latest));
+        return [main, agentList(r.agents),
+                String(r.session_count ?? 0),
+                String(r.checkpoint_count ?? 0),
+                String(r.branch_count ?? 0),
+                fmtDate(r.last_activity || r.created_at)];
       })));
   }
   root.appendChild(p);
@@ -628,15 +717,63 @@ async function vRepoDetail(root, id, params, signal) {
   setNav("repos");
   const d = await api(`/api/repos/${id}`, { signal, ws: wsId });
 
-  const head = el("div", "panel");
-  head.appendChild(el("h2", null, d.repository.name));
+  const head = el("div", "panel repo-head");
+  const title = el("div");
+  title.appendChild(el("h2", null, d.repository.name));
   const meta = el("div", null);
   meta.appendChild(el("span", "mono",
     d.repository.remote || "local only"));
-  head.appendChild(meta);
+  title.appendChild(meta);
+  head.appendChild(title);
+  const stats = d.stats || {};
+  const cards = el("div", "cards repo-stats");
+  for (const [n, l] of [
+    [stats.session_count ?? 0, "Sessions"],
+    [stats.checkpoint_count ?? 0, "Checkpoints"],
+    [stats.branch_count ?? d.branches.length, "Branches"],
+    [(stats.agents || []).length, "Agents"],
+  ]) {
+    const m = el("div", "metric");
+    m.appendChild(el("div", "n", String(n)));
+    m.appendChild(el("div", "l", l));
+    cards.appendChild(m);
+  }
+  head.appendChild(cards);
+  const latest = el("div", "repo-latest");
+  if (stats.latest_session) {
+    const a = sessionLink(stats.latest_session);
+    a.className = "mono blocklink";
+    latest.appendChild(el("span", "hint", "Latest session "));
+    latest.appendChild(a);
+  }
+  if (stats.latest_checkpoint) {
+    const a = checkpointLink(stats.latest_checkpoint);
+    a.classList.add("blocklink");
+    latest.appendChild(el("span", "hint", "Latest checkpoint "));
+    latest.appendChild(a);
+    const detail = [];
+    if (stats.latest_checkpoint.message)
+      detail.push(stats.latest_checkpoint.message);
+    if (stats.latest_checkpoint.branch)
+      detail.push(`on ${stats.latest_checkpoint.branch}`);
+    if (stats.latest_checkpoint.author)
+      detail.push(`by ${stats.latest_checkpoint.author}`);
+    if (detail.length)
+      latest.appendChild(el("span", "hint", detail.join(" · ")));
+  }
+  if (stats.indexed) {
+    latest.appendChild(el("span", "hint",
+      `Memory indexed ${fmtDate(stats.indexed.indexed_at)} ·` +
+      ` commit ${String(stats.indexed.commit_sha || "").slice(0, 10)}`));
+  } else {
+    latest.appendChild(el("span", "hint",
+      "Repository memory has not been indexed yet."));
+  }
+  head.appendChild(latest);
   root.appendChild(head);
 
   const branch = params.get("branch") || "";
+  const q = params.get("q") || "";
   const tab = params.get("tab") === "checkpoints"
     ? "checkpoints" : "sessions";
   const offset = parseInt(params.get("offset") || "0", 10) || 0;
@@ -644,8 +781,10 @@ async function vRepoDetail(root, id, params, signal) {
 
   const nav = (over) => {
     const p = new URLSearchParams();
-    if (over.branch !== undefined ? over.branch : branch)
-      p.set("branch", over.branch !== undefined ? over.branch : branch);
+    const nextBranch = over.branch !== undefined ? over.branch : branch;
+    const nextQ = over.q !== undefined ? over.q : q;
+    if (nextBranch) p.set("branch", nextBranch);
+    if (nextQ) p.set("q", nextQ);
     p.set("tab", over.tab || tab);
     if (over.offset) p.set("offset", String(over.offset));
     location.hash = `#/repos/${id}?${p}`;
@@ -658,7 +797,19 @@ async function vRepoDetail(root, id, params, signal) {
   for (const b of d.branches) sel.appendChild(new Option(b, b));
   sel.value = branch;
   sel.addEventListener("change", () => nav({ branch: sel.value }));
-  filter.appendChild(sel);
+  const qIn = el("input");
+  qIn.value = q;
+  qIn.placeholder = tab === "checkpoints"
+    ? "Search checkpoints…" : "Search sessions…";
+  qIn.setAttribute("aria-label",
+    tab === "checkpoints" ? "Search checkpoints" : "Search sessions");
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") nav({ q: qIn.value.trim(), offset: 0 });
+  });
+  const qBtn = el("button", null, "Filter");
+  qBtn.addEventListener("click", () =>
+    nav({ q: qIn.value.trim(), offset: 0 }));
+  filter.append(sel, qIn, qBtn);
   root.appendChild(filter);
 
   const tabs = el("div", "tabs");
@@ -675,13 +826,18 @@ async function vRepoDetail(root, id, params, signal) {
   const qp = new URLSearchParams({ repo: id, limit: String(limit),
                                    offset: String(offset) });
   if (branch) qp.set("branch", branch);
+  if (q) qp.set("q", q);
   if (tab === "checkpoints") {
     const cps = await api(`/api/checkpoints?${qp}`, { signal, ws: wsId });
     if (cps.items.length) {
       panel.appendChild(table(
-        ["Commit", "Message", "Branch", "Captured"],
-        cps.items.map((c) => [checkpointLink(c), c.message || "—",
-                              c.branch || "—", fmtDate(c.created_at)])));
+        ["Commit", "Message", "Agents", "AI", "Changes", "Files",
+         "Author", "Captured"],
+        cps.items.map((c) => [
+          checkpointLink(c), c.message || "—",
+          agentList(c.agents), aiCell(c), diffDelta(c),
+          String(c.file_count ?? (c.files || []).length),
+          authorCell(c.author), fmtDate(c.created_at)])));
     } else {
       panel.appendChild(el("div", "empty",
         "No checkpoints for this repository."));
@@ -694,10 +850,12 @@ async function vRepoDetail(root, id, params, signal) {
     const ss = await api(`/api/sessions?${qp}`, { signal, ws: wsId });
     if (ss.items.length) {
       panel.appendChild(table(
-        ["Session", "Agent", "Status", "Branch", "Updated"],
-        ss.items.map((s) => [sessionLink(s), agentPill(s.agent),
-                             statusPill(s.status), s.branch || "—",
-                             fmtDate(s.updated_at)])));
+        ["Session", "Agent", "Role", "Status", "Checkpoints", "Steps",
+         "Updated"],
+        ss.items.map((s) => [
+          sessionTitleCell(s), agentPill(s.agent), sessionRole(s),
+          statusPill(s.status), String(s.checkpoint_count ?? 0),
+          String(s.event_count ?? 0), fmtDate(s.updated_at)])));
     } else {
       panel.appendChild(el("div", "empty",
         "No sessions for this repository."));
@@ -776,10 +934,13 @@ async function vSessions(root, params, signal) {
     p.appendChild(el("div", "empty", "No matching sessions."));
   } else {
     p.appendChild(table(
-      ["Session", "Agent", "Status", "Branch", "Model", "Updated"],
+      ["Session", "Agent", "Model", "Role", "Status", "Branch",
+       "Checkpoints", "Steps", "Updated"],
       d.items.map((s) => [
-        sessionLink(s), agentPill(s.agent), statusPill(s.status),
-        s.branch || "—", s.model || "Not reported",
+        sessionTitleCell(s), agentPill(s.agent),
+        s.model || "Not reported", sessionRole(s),
+        statusPill(s.status), s.branch || "—",
+        String(s.checkpoint_count ?? 0), String(s.event_count ?? 0),
         fmtDate(s.updated_at),
       ])));
   }
@@ -818,7 +979,11 @@ async function vSessionDetail(root, id, params, signal) {
   const meta = el("div", "filters");
   meta.appendChild(agentPill(s.agent));
   meta.appendChild(statusPill(s.status));
+  meta.appendChild(el("span", "pill", sessionRole(s)));
   if (s.branch) meta.appendChild(el("span", "pill", `⎇ ${s.branch}`));
+  if (d.children.length)
+    meta.appendChild(el("span", "pill",
+      plural(d.children.length, "direct sub-agent")));
   if (s.parent_session_id) {
     const pa = el("a", "pill", "parent session");
     pa.href = `#/sessions/${s.parent_session_id}`;
@@ -873,7 +1038,8 @@ async function vSessionDetail(root, id, params, signal) {
     b.addEventListener("click", () => {
       const p = new URLSearchParams();
       if (k) p.set("kind", k);
-      location.hash = `#/sessions/${id}${p.size ? "?" + p : ""}`;
+      const tail = p.toString();
+      location.hash = `#/sessions/${id}${tail ? "?" + tail : ""}`;
     });
     filters.appendChild(b);
   });
@@ -918,6 +1084,12 @@ async function vSessionDetail(root, id, params, signal) {
   }
 
   const side = el("div", "panel");
+  side.appendChild(el("h3", null, "Contribution"));
+  side.appendChild(el("div", "cap",
+    `${sessionRole(s)} · ${s.event_count ?? d.events.length} recorded` +
+    ` events · ${s.checkpoint_count ?? d.checkpoints.length}` +
+    ` linked checkpoints` +
+    (d.children.length ? ` · ${d.children.length} direct sub-agents` : "")));
   side.appendChild(el("h3", null, "Checkpoints"));
   if (d.checkpoints.length) {
     for (const cid of d.checkpoints) {
@@ -1003,6 +1175,7 @@ async function vCheckpoints(root, params, signal) {
   const repos = await repoOptions(signal, wsId);
   const repo = params.get("repo") || "";
   const branch = params.get("branch") || "";
+  const q = params.get("q") || "";
   const offset = parseInt(params.get("offset") || "0", 10) || 0;
   const limit = 50;
 
@@ -1016,24 +1189,32 @@ async function vCheckpoints(root, params, signal) {
   bIn.placeholder = "Branch";
   bIn.value = branch;
   bIn.setAttribute("aria-label", "Branch filter");
+  const qIn = el("input");
+  qIn.placeholder = "Search commit, message, or branch…";
+  qIn.value = q;
+  qIn.setAttribute("aria-label", "Checkpoint search");
   const apply = () => {
     const p = new URLSearchParams();
     if (rSel.value) p.set("repo", rSel.value);
     if (bIn.value.trim()) p.set("branch", bIn.value.trim());
+    if (qIn.value.trim()) p.set("q", qIn.value.trim());
     location.hash = `#/checkpoints?${p}`;
   };
   rSel.addEventListener("change", apply);
   bIn.addEventListener("keydown", (e) => {
     if (e.key === "Enter") apply(); });
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
   const go = el("button", null, "Filter");
   go.addEventListener("click", apply);
-  filters.append(rSel, bIn, go);
+  filters.append(rSel, bIn, qIn, go);
   root.appendChild(filters);
 
   const qp = new URLSearchParams({ limit: String(limit),
                                    offset: String(offset) });
   if (repo) qp.set("repo", repo);
   if (branch) qp.set("branch", branch);
+  if (q) qp.set("q", q);
   const d = await api(`/api/checkpoints?${qp}`, { signal, ws: wsId });
   const p = el("div", "panel");
   p.appendChild(el("h2", null, "Checkpoints"));
@@ -1041,10 +1222,14 @@ async function vCheckpoints(root, params, signal) {
     p.appendChild(el("div", "empty", "No checkpoints captured yet."));
   } else {
     p.appendChild(table(
-      ["Commit", "Message", "Branch", "Sessions", "Captured"],
+      ["Commit", "Message", "Branch", "Agents", "AI", "Changes",
+       "Files", "Sessions", "Author", "Captured"],
       d.items.map((c) => [
         checkpointLink(c), c.message || "—", c.branch || "—",
-        String((c.session_ids || []).length), fmtDate(c.created_at),
+        agentList(c.agents), aiCell(c), diffDelta(c),
+        String(c.file_count ?? (c.files || []).length),
+        String(c.session_count ?? (c.session_ids || []).length),
+        authorCell(c.author), fmtDate(c.created_at),
       ])));
   }
   if (d.has_more || offset > 0) {
@@ -1073,20 +1258,26 @@ function _attrLines(att) {
   return m;
 }
 
-function _attrBadge(ent) {
+function _attrBadge(ent, sessionsById) {
   const kind = ent && ent.kind ? ent.kind : "unknown";
   const cls = kind === "agent" ? "attr-ai"
     : kind === "human" ? "attr-hu" : "attr-unk";
   const label = kind === "agent" ? "AI" : kind === "human" ? "HU" : "?";
   const b = el("span", `attr-badge ${cls}`, label);
+  const sess = ent && ent.session_id
+    ? (sessionsById || {})[ent.session_id] : null;
   const parts = [kind === "human" ? "human-side (inferred)" : kind];
+  if (sess && sess.agent) parts.push(sess.agent);
+  if (sess && sess.model) parts.push(sess.model);
   if (ent && ent.evidence) parts.push(ent.evidence);
   if (ent && ent.session_id) parts.push(`session ${ent.session_id}`);
   b.title = `AI attribution estimate: ${parts.join(" · ")}`;
   return b;
 }
 
-function renderAttribution(att) {
+function renderAttribution(att, sessions) {
+  const sessionsById = {};
+  for (const s of sessions || []) sessionsById[s.id] = s;
   const card = el("div", "panel attr-card");
   card.appendChild(el("h3", null, "AI attribution estimate"));
   if (!att || !att.summary) {
@@ -1126,11 +1317,14 @@ function renderAttribution(att) {
   const rows = [];
   for (const f of att.files || []) {
     for (const l of f.lines || []) {
+      const sess = l.session_id ? sessionsById[l.session_id] : null;
       rows.push([
         `${f.path}:${l.side === "new" ? "+" : "-"}${l.line}`,
-        _attrBadge(l),
+        _attrBadge(l, sessionsById),
+        sess ? sess.agent : "—",
+        sess ? (sess.title || sess.native_id || l.session_id.slice(0, 12))
+          : (l.session_id ? l.session_id.slice(0, 12) : "—"),
         l.evidence || "—",
-        l.session_id ? l.session_id.slice(0, 12) : "—",
       ]);
     }
   }
@@ -1139,7 +1333,7 @@ function renderAttribution(att) {
     det.appendChild(el("summary", "hint",
       `All attributed lines (${rows.length})`));
     det.appendChild(table(
-      ["Line", "Estimate", "Evidence", "Session"],
+      ["Line", "Estimate", "Agent", "Session", "Evidence"],
       rows.slice(0, 2000)));
     if (rows.length > 2000) {
       det.appendChild(el("div", "hint",
@@ -1151,7 +1345,9 @@ function renderAttribution(att) {
   return card;
 }
 
-function renderDiff(diff, files, att) {
+function renderDiff(diff, files, att, sessions) {
+  const sessionsById = {};
+  for (const s of sessions || []) sessionsById[s.id] = s;
   const amap = _attrLines(att);
   const wrap = el("div");
   const sections = [];
@@ -1191,11 +1387,11 @@ function renderDiff(diff, files, att) {
       let badge = null;
       if (line.startsWith("+") && !line.startsWith("+++")) {
         span.className = "d-add";
-        if (fmap) badge = _attrBadge(fmap.new[newNo]);
+        if (fmap) badge = _attrBadge(fmap.new[newNo], sessionsById);
         newNo += 1;
       } else if (line.startsWith("-") && !line.startsWith("---")) {
         span.className = "d-del";
-        if (fmap) badge = _attrBadge(fmap.old[oldNo]);
+        if (fmap) badge = _attrBadge(fmap.old[oldNo], sessionsById);
         oldNo += 1;
       } else if (line.startsWith("@@")) {
         span.className = "d-hunk";
@@ -1254,8 +1450,28 @@ async function vCheckpointDetail(root, id, params, signal) {
     `branch ${c.branch || "—"} · author ${c.author || "—"} ·` +
     ` captured ${fmtDate(c.created_at)}`;
   head.appendChild(sub);
+  const facts = el("div", "filters checkpoint-facts");
+  facts.appendChild(el("span", "pill",
+    plural(c.file_count ?? (c.files || []).length, "file")));
+  facts.appendChild(el("span", "pill",
+    plural(c.session_count ?? (c.session_ids || []).length,
+           "linked session")));
+  facts.appendChild(diffDelta(c));
+  const aiPct = c.ai_percentage != null ? c.ai_percentage
+    : (d.attribution && d.attribution.summary
+      ? d.attribution.summary.agent_percentage : null);
+  facts.appendChild(el("span", "pill",
+    aiPct == null ? "AI share not measured" : `${aiPct}% AI`));
+  if ((c.agents || []).length || d.sessions.length) {
+    facts.appendChild(agentList(
+      c.agents && c.agents.length
+        ? c.agents : d.sessions.map((s) => s.agent)));
+  }
+  if (c.token_usage)
+    facts.appendChild(el("span", "pill", tokenLine(c.token_usage)));
+  head.appendChild(facts);
   root.appendChild(head);
-  root.appendChild(renderAttribution(d.attribution));
+  root.appendChild(renderAttribution(d.attribution, d.sessions));
 
   const tab = params.get("tab") || "changes";
   const tabs = el("div", "tabs");
@@ -1274,11 +1490,12 @@ async function vCheckpointDetail(root, id, params, signal) {
     const p = el("div", "panel");
     if (d.sessions.length) {
       p.appendChild(table(
-        ["Session", "Agent", "Status", "Link"],
+        ["Session", "Agent", "Role", "Model", "Status", "Link"],
         d.sessions.map((s) => {
           const link = (c.links || []).find(
             (l) => l.session_id === s.id);
-          return [sessionLink(s), agentPill(s.agent),
+          return [sessionTitleCell(s), agentPill(s.agent),
+                  sessionRole(s), s.model || "Not reported",
                   statusPill(s.status), link ? link.method : "—"];
         })));
     } else {
@@ -1289,7 +1506,8 @@ async function vCheckpointDetail(root, id, params, signal) {
     root.appendChild(p);
   } else {
     const p = el("div", "panel");
-    p.appendChild(renderDiff(c.diff, c.files, d.attribution));
+    p.appendChild(renderDiff(c.diff, c.files, d.attribution,
+      d.sessions));
     root.appendChild(p);
   }
 
@@ -1452,6 +1670,37 @@ async function vSearch(root, params, signal) {
   root.appendChild(p);
 }
 
+const INTEGRATION_MATRIX = [
+  ["Devin", "Native hooks", "Lifecycle + ATIF import", "When reported",
+   "Nested trajectories / parent links", "devin --resume", "Yes"],
+  ["Claude Code", "Native hooks", "Hooks + JSONL import", "Yes",
+   "Nested hook sessions", "claude -r", "Yes"],
+  ["Codex", "Exec JSON stream", "Stream + rollout import", "Yes",
+   "Recorded file-change work", "codex resume", "Yes"],
+  ["ChatGPT", "None", "Conversation export", "No", "No", "No", "Yes"],
+];
+
+const INTEGRATION_DETAILS = {
+  devin: [
+    "SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd and compaction hooks are captured through .devin/hooks.v1.json.",
+    "A session row keeps the Devin session id, model when supplied, branch, parent_session_id, event count, linked checkpoints and recorded token usage.",
+    "Devin sub-agents are represented as child sessions when hooks carry parent_session_id or when an ATIF export contains nested subagent_trajectories.",
+    "Line attribution links measured changed lines back to the exact session id; review the checkpoint's Sessions tab to see which agent or sub-agent produced the evidence.",
+    "`partial resume SESSION --run` plans the documented `devin --resume <native-id>` path; ATIF archives preserve context but are not presented as private Devin state restoration.",
+  ],
+  claude: [
+    "Generated hook settings capture prompts, tool calls, responses, usage and nested sessions.",
+    "Claude JSONL transcripts can be archived and restored only with an explicit trust flag and no overwrite.",
+  ],
+  codex: [
+    "`partial run codex` consumes `codex exec --json`; rollout files can be imported or registered for native resume.",
+    "Turn usage is aggregated from reported token_count/usage events.",
+  ],
+  chatgpt: [
+    "ChatGPT conversations are imported only from an explicit export; Partial does not claim live hooks, native resume, or sub-agent capture for ChatGPT.",
+  ],
+};
+
 async function vIntegrations(root, signal) {
   const wsId = currentWs && currentWs.id;
   const wsCanWrite = !demoMode() && currentWs
@@ -1479,6 +1728,19 @@ async function vIntegrations(root, signal) {
   }
   root.appendChild(intro);
 
+  const matrix = el("div", "panel");
+  matrix.appendChild(el("h2", null, "Capture capability matrix"));
+  matrix.appendChild(el("p", "hint small",
+    "Capabilities describe the recorded evidence available to" +
+    " Partial, not vendor-hosted agent state. Sub-agent rows stay" +
+    " linked to their parent session and are included in checkpoint" +
+    " context."));
+  matrix.appendChild(table(
+    ["Agent", "Hooks", "Transcript", "Tokens", "Sub-agents",
+     "Native resume", "Import"],
+    INTEGRATION_MATRIX));
+  root.appendChild(matrix);
+
   for (const i of d.items) {
     const card = el("div", "integ");
     const h = el("h3");
@@ -1493,6 +1755,22 @@ async function vIntegrations(root, signal) {
       card.appendChild(row);
     }
     card.appendChild(el("p", null, i.note));
+    const details = INTEGRATION_DETAILS[i.agent] || [];
+    if (details.length) {
+      const det = el("details", "integration-details");
+      det.appendChild(el("summary", null,
+        i.agent === "devin"
+          ? "Devin capture, sub-agents, resume, and attribution"
+          : "Captured fields and attribution"));
+      const ul = document.createElement("ul");
+      for (const item of details) {
+        const li = document.createElement("li");
+        li.textContent = item;
+        ul.appendChild(li);
+      }
+      det.appendChild(ul);
+      card.appendChild(det);
+    }
     root.appendChild(card);
   }
 

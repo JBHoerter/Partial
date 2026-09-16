@@ -208,6 +208,25 @@ class Smoke(unittest.TestCase):
         page.wait_for_selector("details.diff-file")
         page.screenshot(path="/tmp/partial-final-checkpoint.png",
                         full_page=True)
+
+        page.goto(self.demo.base + "/app#/repos")
+        page.wait_for_selector("table.list")
+        for text in ("Agents", "Sessions", "Checkpoints", "Branches",
+                     "Last activity"):
+            self.assertTrue(page.locator("th", has_text=text).count())
+        page.get_by_role("link", name="orbit-api").click()
+        page.wait_for_selector(".repo-head")
+        self.assertTrue(page.locator("text=sub-agent").count())
+        page.get_by_role("button", name="Checkpoints").click()
+        page.wait_for_selector("text=100% AI")
+        self.assertTrue(page.locator("text=+1 / −1").count())
+        page.locator("tr", has_text="Add cursor pagination") \
+            .locator('a[href^="#/checkpoints/"]').click()
+        page.wait_for_selector("details.diff-file")
+        self.assertTrue(page.locator("text=agent +1/−1").count())
+        page.get_by_role("button", name="Sessions (2)").click()
+        page.wait_for_selector("text=Review the pagination edge cases")
+        self.assertTrue(page.locator("text=sub-agent").count())
         ctx.close()
 
     def test_02_mobile_no_overflow(self):

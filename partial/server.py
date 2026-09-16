@@ -41,6 +41,9 @@ _SAFE_SESSION_KEYS = (
     "id", "repo_id", "native_id", "agent", "title", "branch",
     "parent_session_id", "model", "status", "started_at", "updated_at",
 )
+_SESSION_SUMMARY_KEYS = (
+    "event_count", "checkpoint_count", "child_count", "is_subagent",
+)
 _ID64_RE = re.compile(r"[0-9a-f]{64}")
 _ID32_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -65,8 +68,12 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _safe_session(s: dict) -> dict:
-    return {k: s.get(k) for k in _SAFE_SESSION_KEYS}
+def _safe_session(s: dict, *, summary: bool = False) -> dict:
+    out = {k: s.get(k) for k in _SAFE_SESSION_KEYS}
+    if summary:
+        for k in _SESSION_SUMMARY_KEYS:
+            out[k] = s.get(k)
+    return out
 
 
 def _validate_public_url(url: str) -> str:
@@ -215,11 +222,20 @@ def _safe_checkpoint(c: dict, *, full: bool) -> dict:
         "message": c.get("message"), "author": c.get("author"),
         "created_at": c.get("created_at"),
         "session_ids": c.get("session_ids") or [],
+        "file_count": c.get("file_count", len(c.get("files") or [])),
+        "session_count": c.get(
+            "session_count", len(c.get("session_ids") or [])),
+        "agents": c.get("agents") or [],
+        "additions": c.get("additions"),
+        "deletions": c.get("deletions"),
+        "ai_percentage": c.get("ai_percentage"),
+        "coverage_percentage": c.get("coverage_percentage"),
     }
     if full:
         out["files"] = c.get("files") or []
         out["diff"] = c.get("diff")
         out["links"] = c.get("links") or []
+        out["token_usage"] = c.get("token_usage")
     return out
 
 
@@ -540,7 +556,15 @@ def _make_handler(ctx):
                 items = [{
                     "id": r["id"], "name": r["name"],
                     "remote": r["remote"], "created_at": r["created_at"],
-                } for r in store.list_repos()]
+                    "session_count": r["session_count"],
+                    "checkpoint_count": r["checkpoint_count"],
+                    "branch_count": r["branch_count"],
+                    "agents": r["agents"],
+                    "last_activity": r["last_activity"],
+                    "latest_session": r["latest_session"],
+                    "latest_checkpoint": r["latest_checkpoint"],
+                    "indexed": r["indexed"],
+                } for r in store.list_repo_summaries()]
                 return self._json(200, {"items": items})
             if path == "/api/sessions":
                 limit, offset = _page(qs, 50, 100)
@@ -548,14 +572,15 @@ def _make_handler(ctx):
                     repo_id=_qs(qs, "repo"), agent=_qs(qs, "agent"),
                     q=_qs(qs, "q"), branch=_qs(qs, "branch"),
                     limit=limit + 1, offset=offset)
-                items = [_safe_session(s) for s in rows[:limit]]
+                items = [_safe_session(s, summary=True)
+                         for s in rows[:limit]]
                 return self._json(200, {
                     "items": items, "has_more": len(rows) > limit})
             if path == "/api/checkpoints":
                 limit, offset = _page(qs, 50, 100)
                 rows = store.list_checkpoints(
                     repo_id=_qs(qs, "repo"), branch=_qs(qs, "branch"),
-                    limit=limit + 1, offset=offset)
+                    q=_qs(qs, "q"), limit=limit + 1, offset=offset)
                 items = [_safe_checkpoint(c, full=False)
                          for c in rows[:limit]]
                 return self._json(200, {
@@ -586,16 +611,21 @@ def _make_handler(ctx):
             if m:
                 if not _ID64_RE.fullmatch(m):
                     raise ApiError(404, "repository not found")
-                repo = store.get_repo(m)
+                repo = store.repo_summary(m)
                 if repo is None:
                     raise ApiError(404, "repository not found")
+                stats = {k: repo[k] for k in (
+                    "session_count", "checkpoint_count",
+                    "branch_count", "agents", "last_activity",
+                    "latest_session", "latest_checkpoint", "indexed")}
                 return self._json(200, {
                     "repository": {
                         "id": repo["id"], "name": repo["name"],
                         "remote": repo["remote"],
                         "created_at": repo["created_at"],
                     },
-                    "branches": store.repo_branches(m)})
+                    "branches": store.repo_branches(m),
+                    "stats": stats})
             m = _match(path, "/api/sessions/", suffix="/usage")
             if m:
                 if not _ID64_RE.fullmatch(m):
@@ -687,7 +717,8 @@ def _make_handler(ctx):
                 cp = store.get_checkpoint(m)
                 if cp is None:
                     raise ApiError(404, "checkpoint not found")
-                sessions = [_safe_session(s) for s in
+                cp["token_usage"] = store.checkpoint_token_usage(m)
+                sessions = [_safe_session(s, summary=True) for s in
                             store.sessions_for_checkpoint(m)]
                 return self._json(200, {
                     "checkpoint": _safe_checkpoint(cp, full=True),
@@ -710,10 +741,13 @@ def _make_handler(ctx):
                 e["data"] = store.strip_paths(
                     e.get("data") or {}, row["repo_id"])
                 events.append(_safe_event(e))
-            children = [_safe_session(s)
+            children = [_safe_session(s, summary=True)
                         for s in store.child_sessions(row["id"])]
+            session = _safe_session(row, summary=True)
+            session.update(store.session_rollup(row["id"]))
+            session["is_subagent"] = row.get("parent_session_id") is not None
             return self._json(200, {
-                "session": _safe_session(row),
+                "session": session,
                 "events": events,
                 "has_more": len(rows) > limit,
                 "checkpoints": store.checkpoints_for_session(

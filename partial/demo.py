@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 
@@ -31,12 +32,13 @@ def _repo(store: Store, name: str) -> str:
 
 def _ev(i: int, sid: str, agent: str, kind: str, minute: int,
         second: int = 0, text: str = "", tool_name=None,
-        data=None) -> Event:
+        data=None, parent_session_id=None, model=None) -> Event:
     return Event(
         id=sha256_hex(f"partial-demo:ev:{sid}:{i}"),
         session_id=sid, agent=agent, kind=kind,
         timestamp=_ts(minute, second), text=text,
         tool_name=tool_name, data=data or {},
+        parent_session_id=parent_session_id, model=model,
     )
 
 
@@ -48,7 +50,8 @@ def create_demo_store() -> Store:
 
     devin_sid = "demo-devin-1"
     store.ingest(orbit, [
-        _ev(0, devin_sid, "devin", "session_start", 0),
+        _ev(0, devin_sid, "devin", "session_start", 0,
+            model="SWE-2 Max"),
         _ev(1, devin_sid, "devin", "prompt", 0, 10,
             text="Add cursor pagination to the activity feed."),
         _ev(2, devin_sid, "devin", "tool", 1, 0,
@@ -60,14 +63,32 @@ def create_demo_store() -> Store:
                 },
                 "tool_response": {"success": True},
             }),
-        _ev(3, devin_sid, "devin", "response", 2, 0,
+        _ev(3, devin_sid, "devin", "usage", 1, 30,
+            data={"usage": {"input_tokens": 4200,
+                            "output_tokens": 740,
+                            "cached_input_tokens": 900},
+                  "usage_scope": "delta", "usage_id": "step-3"}),
+        _ev(4, devin_sid, "devin", "response", 2, 0,
             text="The endpoint now returns a stable cursor and"
                  " preserves the requested page size."),
     ], branch="main")
 
+    devin_child = "demo-devin-1:subagent:review"
+    store.ingest(orbit, [
+        _ev(0, devin_child, "devin", "session_start", 1, 5,
+            parent_session_id=devin_sid, model="SWE-2 Max"),
+        _ev(1, devin_child, "devin", "prompt", 1, 10,
+            text="Review the pagination edge cases before the edit.",
+            parent_session_id=devin_sid),
+        _ev(2, devin_child, "devin", "response", 1, 40,
+            text="Checked cursor bounds and descending-order edge cases.",
+            parent_session_id=devin_sid),
+    ], branch="main")
+
     codex_sid = "demo-codex-1"
     store.ingest(orbit, [
-        _ev(0, codex_sid, "codex", "session_start", 3),
+        _ev(0, codex_sid, "codex", "session_start", 3,
+            model="GPT-5 Codex"),
         _ev(1, codex_sid, "codex", "prompt", 3, 20,
             text="Cover expired access tokens with a regression test."),
         _ev(2, codex_sid, "codex", "tool", 4, 0,
@@ -75,7 +96,11 @@ def create_demo_store() -> Store:
                 "changes": [{"path": "tests/test_auth.py",
                              "kind": "update"}],
             }),
-        _ev(3, codex_sid, "codex", "response", 5, 0,
+        _ev(3, codex_sid, "codex", "usage", 4, 20,
+            data={"usage": {"input_tokens": 3100,
+                            "output_tokens": 520},
+                  "usage_scope": "delta", "usage_id": "turn-1"}),
+        _ev(4, codex_sid, "codex", "response", 5, 0,
             text="Added coverage for expired tokens and verified that"
                  " refresh failures are surfaced."),
     ], branch="main")
@@ -136,7 +161,9 @@ def create_demo_store() -> Store:
         author="Partial Demo <demo@localhost>",
         files=["src/routes/activity.py"], diff=diff_activity,
         links=[(scoped_session_id(orbit, "devin", devin_sid),
-                "observed-worktree-overlap")],
+                "observed-worktree-overlap"),
+               (scoped_session_id(orbit, "devin", devin_child),
+                "subagent-transcript")],
         worktree=None, created_at=_ts(2, 30),
     )
     store.save_checkpoint(
@@ -161,6 +188,45 @@ def create_demo_store() -> Store:
                 "observed-worktree-overlap")],
         worktree=None, created_at=_ts(8, 0),
     )
+
+    demo_cp = sha256_hex("partial-demo:checkpoint:1")[:32]
+    devin_scoped = scoped_session_id(orbit, "devin", devin_sid)
+    conn = store._connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoint_attribution"
+            "(checkpoint_id,report) VALUES(?,?)",
+            (demo_cp, json.dumps({
+                "version": 1,
+                "method": "position-aware-snapshot-diff-v1",
+                "capture_source": "local-observation",
+                "summary": {
+                    "agent_added": 1, "agent_removed": 1,
+                    "human_added": 0, "human_removed": 0,
+                    "unknown_added": 0, "unknown_removed": 0,
+                    "total_changed": 2,
+                    "agent_percentage": 100.0,
+                    "coverage_percentage": 100.0},
+                "files": [{
+                    "path": "src/routes/activity.py",
+                    "lines": [
+                        {"side": "old", "line": 40,
+                         "kind": "agent",
+                         "session_id": devin_scoped,
+                         "evidence": "pre/post tool snapshot"},
+                        {"side": "new", "line": 40,
+                         "kind": "agent",
+                         "session_id": devin_scoped,
+                         "evidence": "pre/post tool snapshot"},
+                    ]}],
+                "excluded": [],
+                "limitations": [
+                    "Synthetic demo attribution; real captures require"
+                    " pre/post tool snapshots."],
+            })))
+        conn.commit()
+    finally:
+        conn.close()
 
     from .memory import Memory, document_id
     mem = Memory(store)
