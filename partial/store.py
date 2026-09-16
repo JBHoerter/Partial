@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -21,9 +22,15 @@ from .models import (
     sha256_hex,
     validate_event,
 )
-from .privacy import redact
+from .privacy import has_secret_pattern, redact
+from . import attribution as _attr
+from . import brain_contract
+from .brain_contract import EMBEDDING_MODEL
 
 SCHEMA_VERSION = 1
+RUN_KINDS = ("ask", "review", "investigate", "dispatch")
+RUN_STATUSES = ("planned", "running", "completed", "partial",
+                "error", "interrupted", "imported")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS repositories(
@@ -92,6 +99,54 @@ CREATE TABLE IF NOT EXISTS reviews(
     body TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS attribution_files(
+    repo_id TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    path TEXT NOT NULL,
+    base_commit TEXT,
+    state TEXT NOT NULL,
+    PRIMARY KEY(repo_id,worktree,path)
+);
+CREATE TABLE IF NOT EXISTS attribution_pending(
+    repo_id TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    call_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    before_hashes TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    ambiguous INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(repo_id,worktree,session_id,call_key,path)
+);
+CREATE TABLE IF NOT EXISTS checkpoint_attribution(
+    checkpoint_id TEXT PRIMARY KEY REFERENCES checkpoints(id),
+    report TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS native_sessions(
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    agent TEXT NOT NULL,
+    native_id TEXT NOT NULL,
+    format TEXT NOT NULL,
+    local_path TEXT,
+    archive TEXT,
+    registered_at TEXT NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_settings(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects(
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_repos(
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    repo_id TEXT NOT NULL REFERENCES repositories(id),
+    PRIMARY KEY(project_id, repo_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts
     ON events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_repo_updated
@@ -107,6 +162,21 @@ MUTATING_TOOLS = {
     "edit_file", "write_file", "create_file",
 }
 _PATH_KEYS = ("file_path", "path", "target_file", "notebook_path", "filename")
+# Event ``data`` keys whose values denote local filesystem paths.
+# Keys are compared after lowercasing and stripping non-alphanumerics,
+# so snake_case and camelCase spellings (``file_path``/``filePath``)
+# match alike.  ``_strip_event_paths`` rewrites absolute values under
+# these keys at any nesting depth so API responses, handoffs, memory
+# documents, and exported bundles never carry machine-local paths
+# (worktree roots, home directories, provider state dirs such as
+# ``~/.claude``).  Relative values and non-path keys pass through
+# untouched, so safe relative paths and ordinary text stay useful.
+_STRIP_PATH_KEYS = frozenset({
+    "cwd", "workdir", "worktree", "workspace", "root", "projectdir",
+    "projectroot", "reporoot", "checkoutroot", "directory", "dir",
+    "localpath", "transcriptpath", "filepath", "path", "paths",
+    "files", "targetfile", "notebookpath", "filename",
+})
 _SESSION_STATUSES = ("active", "idle", "ended")
 _STATUS_BY_KIND = {
     "session_end": "ended",
@@ -119,6 +189,164 @@ _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 _SHA_RE = re.compile(r"([0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_STR = 8192
+_NATIVE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+NATIVE_AGENTS = ("devin", "claude", "codex")
+NATIVE_FORMAT_FOR = {
+    "claude": "claude-jsonl",
+    "codex": "codex-rollout",
+    "devin": "devin-atif",
+}
+_NATIVE_FORMATS = tuple(NATIVE_FORMAT_FOR.values()) + ("native-id",)
+
+# Per-process owner token stamped on workflow runs saved with status
+# "running".  `interrupt_running_runs` only marks a running row
+# interrupted when its recorded owner pid is provably dead (or the row
+# predates owner tracking), so a second Partial process sharing the same
+# store can never mislabel another live process's job as interrupted.
+_RUN_OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:16]}"
+
+# Run ``details`` keys reserved for internal process-ownership
+# bookkeeping.  ``run_owner`` is the canonical marker stamped by
+# ``save_run``; ``runner``/``pid`` are the legacy server marker and
+# may still be present in databases written before ``run_owner``
+# existed.  None of them are ever trusted from callers or bundles,
+# and all are stripped from get/list/export so they cannot leak
+# through an API response or a transport bundle.
+_RUN_INTERNAL_DETAILS = frozenset({"run_owner", "runner", "pid"})
+
+
+def _strip_run_details(details: dict) -> dict:
+    return {k: v for k, v in details.items()
+            if k not in _RUN_INTERNAL_DETAILS}
+
+
+_SEED_SOURCE_RE = re.compile(r"seed:[^/\x00]{1,190}")
+_REVIEW_SOURCE_RE = re.compile(
+    r"review:(?:[0-9a-f]{40}|[0-9a-f]{64})"
+    r"\.\.(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_RUN_PAYLOAD_MAX = 200000
+
+
+def _run_owner_pid(owner: object) -> int | None:
+    if not isinstance(owner, str):
+        return None
+    head, sep, _token = owner.partition("-")
+    if not sep or not head.isdigit():
+        return None
+    return int(head)
+
+
+def _pid_alive(pid: int | None) -> bool:
+    """Best-effort liveness check for a recorded run-owner pid.
+
+    POSIX ``kill(pid, 0)`` is authoritative; a permission error still
+    means the process exists.  On platforms without kill(2) semantics
+    we cannot verify liveness cheaply and conservatively report the
+    owner as alive, which never mislabels a running job.
+    """
+    if type(pid) is not int or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _validate_attribution(conn, entry, known_cps, session_repo) -> dict:
+    cid = entry.get("checkpoint_id")
+    if not isinstance(cid, str) or cid not in known_cps:
+        raise ValueError("attribution references unknown checkpoint")
+    rep = entry.get("report")
+    if not isinstance(rep, dict):
+        raise ValueError("attribution report must be an object")
+    if rep.get("version") != 1 or rep.get("method") != _attr.METHOD:
+        raise ValueError("unsupported attribution report format")
+    row = conn.execute(
+        "SELECT files FROM checkpoints WHERE id=?", (cid,)).fetchone()
+    cp_files = set(json.loads(row["files"])) if row else set()
+    files = rep.get("files")
+    if not isinstance(files, list) or len(files) > 10000:
+        raise ValueError("attribution files must be a bounded list")
+    seen: set = set()
+    out_files = []
+    for f in files:
+        if not isinstance(f, dict):
+            raise ValueError("attribution file must be an object")
+        path = f.get("path")
+        lines = f.get("lines")
+        if not isinstance(path, str) or not path \
+                or len(path) > 4096 or path not in cp_files:
+            raise ValueError(
+                "attribution file path not in checkpoint")
+        if path in seen:
+            raise ValueError("duplicate attribution file path")
+        seen.add(path)
+        if not isinstance(lines, list) or len(lines) > 20000:
+            raise ValueError("attribution lines must be a bounded list")
+        norm_lines = []
+        for ent in lines:
+            if not isinstance(ent, dict):
+                raise ValueError("attribution line must be an object")
+            norm = {k: ent.get(k) for k in
+                    ("side", "line", "kind", "session_id", "evidence")}
+            if norm["side"] not in ("old", "new"):
+                raise ValueError("invalid attribution line side")
+            if type(norm["line"]) is not int \
+                    or not 1 <= norm["line"] <= _attr.MAX_LINES:
+                raise ValueError("invalid attribution line position")
+            if norm["kind"] not in _attr.KINDS \
+                    or norm["evidence"] not in _attr.EVIDENCE:
+                raise ValueError(
+                    "invalid attribution kind or evidence")
+            s = norm.get("session_id")
+            if norm["kind"] == "agent":
+                if not isinstance(s, str) or s not in session_repo \
+                        or session_repo[s] != known_cps[cid]:
+                    raise ValueError(
+                        "attribution references foreign session")
+            else:
+                norm["session_id"] = None
+            norm_lines.append(norm)
+        summary = _attr.summarize(norm_lines)
+        out_files.append(
+            {"path": path, "lines": norm_lines, "summary": summary})
+    excluded = rep.get("excluded") or []
+    if not isinstance(excluded, list) or len(excluded) > 10000:
+        raise ValueError("attribution excluded must be a bounded list")
+    out_excl = []
+    excl_seen = set()
+    for x in excluded:
+        if not isinstance(x, dict) \
+                or not isinstance(x.get("path"), str) \
+                or len(x["path"]) > 4096 \
+                or not isinstance(x.get("reason"), str) \
+                or len(x["reason"]) > 128:
+            raise ValueError("invalid attribution excluded entry")
+        if x["path"] not in cp_files or x["path"] in seen \
+                or x["path"] in excl_seen:
+            raise ValueError(
+                "attribution excluded path is invalid for checkpoint")
+        excl_seen.add(x["path"])
+        out_excl.append({"path": x["path"], "reason": x["reason"]})
+    for p in sorted(cp_files - seen - excl_seen):
+        out_excl.append({"path": p, "reason": "missing-report"})
+    lims = _attr.report(_attr.new_state([]), [])["limitations"]
+    return {
+        "version": 1, "method": _attr.METHOD,
+        "capture_source": "imported-claim",
+        "summary": _attr.aggregate(out_files),
+        "files": out_files, "excluded": out_excl,
+        "limitations": lims,
+    }
 
 
 def default_db_path() -> Path:
@@ -283,37 +511,56 @@ def _like_esc(q: str) -> str:
     return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+_WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_path_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    norm = re.sub(r"[^a-z0-9]", "", key.lower())
+    return norm in _STRIP_PATH_KEYS
+
+
 def _strip_path_value(v: object, roots: list[str]) -> object:
-    if not isinstance(v, str) or not v.startswith("/"):
+    if not isinstance(v, str):
         return v
     for root in roots:
         if v == root:
             return "."
         if v.startswith(root + "/"):
             return v[len(root) + 1:]
+    if v.startswith("/") or _WIN_ABS_RE.match(v):
+        # Absolute but outside every known root (e.g. a provider's
+        # state directory): keep only the basename so no machine-local
+        # directory layout leaks, while the name itself stays useful.
+        return v.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] \
+            or "."
+    return v
+
+
+def _strip_paths_node(v: object, roots: list[str],
+                      path_key: bool) -> object:
+    if isinstance(v, dict):
+        return {k: _strip_paths_node(x, roots, _is_path_key(k))
+                for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [
+            _strip_path_value(x, roots)
+            if path_key and isinstance(x, str)
+            else _strip_paths_node(x, roots, False)
+            for x in v
+        ]
+    if path_key:
+        return _strip_path_value(v, roots)
     return v
 
 
 def _strip_event_paths(data: dict, roots: list[str]) -> dict:
-    if not roots or not isinstance(data, dict):
+    if not isinstance(data, dict):
         return data
-    roots = sorted(set(roots), key=len, reverse=True)
-    out = dict(data)
-    ti = out.get("tool_input")
-    if isinstance(ti, dict):
-        ti = dict(ti)
-        for k in _PATH_KEYS:
-            if k in ti:
-                ti[k] = _strip_path_value(ti[k], roots)
-        out["tool_input"] = ti
-    changes = out.get("changes")
-    if isinstance(changes, list):
-        out["changes"] = [
-            {**ch, "path": _strip_path_value(ch.get("path"), roots)}
-            if isinstance(ch, dict) else ch
-            for ch in changes
-        ]
-    return out
+    roots = sorted({str(Path(str(r))) for r in roots if r},
+                   key=len, reverse=True)
+    return _strip_paths_node(data, roots, False)
 
 
 def _bounded_str(v: object, name: str, limit: int = _MAX_STR) -> str | None:
@@ -346,14 +593,30 @@ class Store:
             fd = os.open(str(db), os.O_CREAT | os.O_WRONLY, 0o600)
             os.close(fd)
         conn = self._connect()
+        self.fts_ok = True
         try:
             conn.executescript(_SCHEMA)
+            try:
+                conn.executescript(brain_contract.SCHEMA)
+            except sqlite3.OperationalError as exc:
+                if "fts5" not in str(exc).lower():
+                    raise
+                self.fts_ok = False
+                stmts = [s for s in brain_contract.SCHEMA.split(";")
+                         if s.strip() and "fts5" not in s.lower()]
+                conn.executescript(";\n".join(stmts))
             conn.execute("BEGIN IMMEDIATE")
             cols = {r["name"] for r in conn.execute(
                 "PRAGMA table_info(reviews)")}
             if "user_id" not in cols:
                 conn.execute(
                     "ALTER TABLE reviews ADD COLUMN user_id TEXT")
+            mcols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(memory_documents)")}
+            if mcols and "archived" not in mcols:
+                conn.execute(
+                    "ALTER TABLE memory_documents ADD COLUMN"
+                    " archived INTEGER NOT NULL DEFAULT 0")
             conn.commit()
         finally:
             conn.close()
@@ -739,6 +1002,357 @@ class Store:
         finally:
             conn.close()
 
+    def get_attribution(self, checkpoint_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT report FROM checkpoint_attribution"
+                " WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
+            return json.loads(row["report"]) if row else None
+        finally:
+            conn.close()
+
+    def add_pending_paths(self, repo_id: str, session_id: str,
+                          paths: list[str], worktree: str) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                for p in paths:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO pending_paths(repo_id,"
+                        "session_id,path,worktree,created_at)"
+                        " VALUES(?,?,?,?,?)",
+                        (repo_id, session_id, p, worktree, now_iso()))
+        finally:
+            conn.close()
+
+    def end_session(self, session_id: str) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE sessions SET status='ended',"
+                    " updated_at=? WHERE id=?",
+                    (now_iso(), session_id))
+        finally:
+            conn.close()
+
+    def upsert_native(self, session_id: str, agent: str,
+                      native_id: str, fmt: str, *,
+                      local_path: str | None, archive: str | None,
+                      source: str) -> dict:
+        if agent not in NATIVE_AGENTS:
+            raise ValueError(f"invalid native agent: {agent!r}")
+        if fmt != "native-id" and fmt != NATIVE_FORMAT_FOR.get(agent):
+            raise ValueError(f"invalid native format: {fmt!r}")
+        conn = self._connect()
+        try:
+            with conn:
+                existing = conn.execute(
+                    "SELECT * FROM native_sessions WHERE session_id=?",
+                    (session_id,)).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO native_sessions(session_id,agent,"
+                        "native_id,format,local_path,archive,"
+                        "registered_at,source) VALUES(?,?,?,?,?,?,?,?)",
+                        (session_id, agent, native_id, fmt, local_path,
+                         archive, now_iso(), source))
+                else:
+                    if existing["agent"] != agent \
+                            or existing["native_id"] != native_id:
+                        raise ValueError(
+                            "native registration conflicts with"
+                            " existing identity")
+                    upgrade = existing["format"] == "native-id" \
+                        or existing["format"] == fmt
+                    if not upgrade:
+                        raise ValueError(
+                            "cannot change native format from"
+                            f" {existing['format']} to {fmt}")
+                    conn.execute(
+                        "UPDATE native_sessions SET format=?,"
+                        " local_path=COALESCE(?,local_path),"
+                        " archive=COALESCE(?,archive),"
+                        " registered_at=?, source=?"
+                        " WHERE session_id=?",
+                        (fmt, local_path, archive, now_iso(), source,
+                         session_id))
+            return self.get_native(session_id)
+        finally:
+            conn.close()
+
+    def get_native(self, session_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM native_sessions WHERE session_id=?",
+                (session_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_native(self, *, repo_id: str | None = None) -> list[dict]:
+        sql = ("SELECT n.session_id,n.agent,n.native_id,n.format,"
+               "n.registered_at,n.source,"
+               "n.local_path IS NOT NULL AS has_local_path,"
+               "n.archive IS NOT NULL AS has_archive"
+               " FROM native_sessions n JOIN sessions s"
+               " ON s.id=n.session_id")
+        params: list = []
+        if repo_id:
+            sql += " WHERE s.repo_id=?"
+            params.append(repo_id)
+        sql += " ORDER BY n.registered_at,n.session_id"
+        conn = self._connect()
+        try:
+            return [dict(r) for r in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+    def memory_setting(self, key: str) -> str | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM memory_settings WHERE key=?",
+                (key,)).fetchone()
+            return row["value"] if row else None
+        finally:
+            conn.close()
+
+    def set_memory_setting(self, key: str, value: str) -> None:
+        if not isinstance(key, str) or not re.fullmatch(
+                r"[a-z0-9_.-]{1,64}", key):
+            raise ValueError("invalid setting key")
+        if not isinstance(value, str) or len(value) > 2000:
+            raise ValueError("invalid setting value")
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO memory_settings(key,value)"
+                    " VALUES(?,?) ON CONFLICT(key)"
+                    " DO UPDATE SET value=excluded.value",
+                    (key, value))
+                conn.commit()
+        finally:
+            conn.close()
+
+    def save_run(self, run_id: str, kind: str, repo_id: str | None,
+                 status: str, source_ids: list[str], report: dict,
+                 details: dict) -> None:
+        if not isinstance(run_id, str) or not _HEX64_RE.fullmatch(
+                run_id):
+            raise ValueError("invalid workflow run id")
+        if kind not in RUN_KINDS:
+            raise ValueError("invalid workflow kind")
+        if status not in RUN_STATUSES:
+            raise ValueError("invalid workflow status")
+        if repo_id is not None and not _HEX64_RE.fullmatch(
+                str(repo_id)):
+            raise ValueError("invalid workflow repo_id")
+        if not isinstance(source_ids, list) or len(source_ids) > 500 \
+                or any(not isinstance(x, str)
+                       or not _HEX64_RE.fullmatch(x)
+                       for x in source_ids):
+            raise ValueError("invalid workflow source_ids")
+        if not isinstance(report, dict) or not isinstance(details, dict):
+            raise ValueError("workflow report/details must be objects")
+        # Internal ownership markers are never trusted from the
+        # caller; the only persisted marker is the one stamped here.
+        details = _strip_run_details(details)
+        if status == "running":
+            # Stamp the owning process so interrupted-run recovery can
+            # tell a dead owner from a live one; never trusted from
+            # the caller.
+            details["run_owner"] = _RUN_OWNER
+        if len(canonical_json(report)) > _RUN_PAYLOAD_MAX \
+                or len(canonical_json(details)) > _RUN_PAYLOAD_MAX \
+                or len(canonical_json(source_ids)) > _RUN_PAYLOAD_MAX:
+            raise ValueError("workflow run payload too large")
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO workflow_runs(id,kind,"
+                    "repo_id,status,created_at,updated_at,source_ids,"
+                    "report,details)"
+                    " VALUES(?,?,?,?,"
+                    "COALESCE((SELECT created_at FROM workflow_runs"
+                    " WHERE id=?),?),?,?,?,?)",
+                    (run_id, kind, repo_id, status, run_id,
+                     now_iso(), now_iso(), canonical_json(source_ids),
+                     canonical_json(report), canonical_json(details)))
+                conn.commit()
+        finally:
+            conn.close()
+
+    def interrupt_running_runs(self) -> int:
+        """Mark dead 'running' workflow runs as interrupted.
+
+        Runs saved with status 'running' carry a per-process owner
+        token (``details.run_owner`` = ``"<pid>-<random>"``).  A row is
+        only interrupted when its owner pid is verifiably dead, or when
+        the row carries no usable owner (legacy/forged records cannot be
+        attributed to a live process).  Rows owned by a live local
+        process are left untouched so a second Partial process sharing
+        this store cannot mislabel its jobs.  Rows written before
+        ``run_owner`` existed may carry the legacy server ``pid``
+        marker; a live recorded pid is still honoured.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                rows = conn.execute(
+                    "SELECT id,details FROM workflow_runs"
+                    " WHERE status='running'").fetchall()
+                count = 0
+                for r in rows:
+                    try:
+                        det = json.loads(r["details"])
+                    except (ValueError, TypeError):
+                        det = {}
+                    if not isinstance(det, dict):
+                        det = {}
+                    pid = _run_owner_pid(det.get("run_owner"))
+                    if pid is None:
+                        # Legacy rows may only have the pre-run_owner
+                        # server marker ("runner"/"pid").
+                        pid = det.get("pid")
+                    if _pid_alive(pid):
+                        continue
+                    clean = _strip_run_details(det)
+                    conn.execute(
+                        "UPDATE workflow_runs SET status='interrupted',"
+                        " report=?, details=?, updated_at=?"
+                        " WHERE id=?",
+                        (canonical_json({
+                            "error": "interrupted: the server or CLI"
+                                     " process exited before this run"
+                                     " finished"}),
+                         canonical_json(clean), now_iso(), r["id"]))
+                    count += 1
+                conn.commit()
+                return count
+        finally:
+            conn.close()
+
+    def get_run(self, run_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM workflow_runs WHERE id=?",
+                (run_id,)).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            d["source_ids"] = json.loads(d["source_ids"])
+            d["report"] = json.loads(d["report"])
+            d["details"] = json.loads(d["details"])
+            if isinstance(d["details"], dict):
+                d["details"] = _strip_run_details(d["details"])
+            return d
+        finally:
+            conn.close()
+
+    def list_runs(self, *, repo_id=None, kind=None,
+                  limit: int = 100) -> list[dict]:
+        sql = "SELECT * FROM workflow_runs WHERE 1=1"
+        params: list = []
+        if repo_id:
+            sql += " AND repo_id=?"
+            params.append(repo_id)
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY created_at DESC,id LIMIT ?"
+        params.append(int(limit))
+        conn = self._connect()
+        try:
+            out = []
+            for r in conn.execute(sql, params).fetchall():
+                d = dict(r)
+                d["source_ids"] = json.loads(d["source_ids"])
+                d["report"] = json.loads(d["report"])
+                d["details"] = json.loads(d["details"])
+                if isinstance(d["details"], dict):
+                    d["details"] = _strip_run_details(d["details"])
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+    def create_project(self, name: str) -> dict:
+        if not isinstance(name, str) or not name.strip() \
+                or len(name) > 200:
+            raise ValueError("project name must be 1..200 chars")
+        pid = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO projects(id,name,created_at)"
+                    " VALUES(?,?,?)",
+                    (pid, name.strip(), now_iso()))
+                conn.commit()
+            return {"id": pid, "name": name.strip(),
+                    "repos": []}
+        finally:
+            conn.close()
+
+    def attach_project_repo(self, project_id: str,
+                            repo_id: str) -> dict:
+        conn = self._connect()
+        try:
+            with conn:
+                if conn.execute(
+                        "SELECT 1 FROM projects WHERE id=?",
+                        (project_id,)).fetchone() is None:
+                    raise KeyError(project_id)
+                if conn.execute(
+                        "SELECT 1 FROM repositories WHERE id=?",
+                        (repo_id,)).fetchone() is None:
+                    raise KeyError(repo_id)
+                conn.execute(
+                    "INSERT OR IGNORE INTO project_repos(project_id,"
+                    "repo_id) VALUES(?,?)", (project_id, repo_id))
+                conn.commit()
+            return self.get_project(project_id)
+        finally:
+            conn.close()
+
+    def get_project(self, project_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE id=?",
+                (project_id,)).fetchone()
+            if row is None:
+                return None
+            p = dict(row)
+            p["repos"] = [r["repo_id"] for r in conn.execute(
+                "SELECT repo_id FROM project_repos WHERE project_id=?"
+                " ORDER BY repo_id", (project_id,)).fetchall()]
+            return p
+        finally:
+            conn.close()
+
+    def list_projects(self) -> list[dict]:
+        conn = self._connect()
+        try:
+            out = []
+            for r in conn.execute(
+                    "SELECT * FROM projects ORDER BY name").fetchall():
+                p = dict(r)
+                p["repos"] = [x["repo_id"] for x in conn.execute(
+                    "SELECT repo_id FROM project_repos"
+                    " WHERE project_id=? ORDER BY repo_id",
+                    (p["id"],)).fetchall()]
+                out.append(p)
+            return out
+        finally:
+            conn.close()
+
     def _session_events(self, conn, sid: str) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM events WHERE session_id=?"
@@ -980,6 +1594,72 @@ class Store:
                             if c["id"] not in seen]
                 seen.update(frontier)
                 sid_set.extend(frontier)
+            cp_ids = {checkpoint_id}
+            extra_cps: dict[str, dict] = {}
+            # Closure fixpoint: documents cited by exported decisions or
+            # workflow runs must import cleanly, so pull in the sessions
+            # (with their events) and checkpoints those documents
+            # reference, plus everything those checkpoints reference in
+            # turn.
+            while True:
+                mem = self._export_memory(
+                    conn, [cp["repo_id"]], checkpoint=cp,
+                    session_ids=seen)
+                want_sessions: set[str] = set()
+                want_cps: set[str] = set()
+                for d in mem["documents"]:
+                    src = str(d.get("source_id") or "")
+                    if d["kind"] == "session":
+                        if src.startswith("seed:"):
+                            continue
+                        sess = src.split(":", 1)[0]
+                        if sess not in seen:
+                            want_sessions.add(sess)
+                    elif d["kind"] == "checkpoint":
+                        if src.startswith("review:"):
+                            continue
+                        if src not in cp_ids:
+                            want_cps.add(src)
+                added = False
+                for cpid in sorted(want_cps):
+                    crow = conn.execute(
+                        "SELECT * FROM checkpoints WHERE id=?"
+                        " AND repo_id=?",
+                        (cpid, cp["repo_id"])).fetchone()
+                    if crow is None:
+                        continue
+                    cp_ids.add(cpid)
+                    cextra = dict(crow)
+                    cextra["files"] = json.loads(cextra["files"])
+                    cextra["session_ids"] = json.loads(
+                        cextra["session_ids"])
+                    extra_cps[cpid] = cextra
+                    added = True
+                    for s in cextra["session_ids"]:
+                        if s not in seen:
+                            want_sessions.add(s)
+                    for l in self._checkpoint_links(conn, cpid):
+                        if l["session_id"] not in seen:
+                            want_sessions.add(l["session_id"])
+                frontier = [s for s in sorted(want_sessions)
+                            if s not in seen]
+                if frontier:
+                    added = True
+                    seen.update(frontier)
+                    sid_set.extend(frontier)
+                    while frontier:
+                        placeholders = ",".join("?" for _ in frontier)
+                        children = conn.execute(
+                            "SELECT id FROM sessions WHERE"
+                            f" parent_session_id IN ({placeholders})",
+                            frontier,
+                        ).fetchall()
+                        frontier = [c["id"] for c in children
+                                    if c["id"] not in seen]
+                        seen.update(frontier)
+                        sid_set.extend(frontier)
+                if not added:
+                    break
             sessions = self._session_public_rows(conn, sid_set)
             roots = self._export_roots(conn, [cp["repo_id"]], sid_set)
             events = []
@@ -997,21 +1677,661 @@ class Store:
                          json.loads(e["data"]), roots)}
                     for e in rows
                 ]
+            cp_marks = ",".join("?" for _ in cp_ids)
+            all_links = conn.execute(
+                "SELECT checkpoint_id,session_id,method FROM"
+                f" checkpoint_links WHERE checkpoint_id IN ({cp_marks})"
+                " ORDER BY checkpoint_id,session_id",
+                sorted(cp_ids),
+            ).fetchall()
             return {
                 "version": SCHEMA_VERSION,
                 "repositories": [dict(repo)] if repo else [],
                 "sessions": sessions,
                 "events": events,
-                "checkpoints": [cp],
-                "links": [
-                    {"checkpoint_id": checkpoint_id,
-                     "session_id": l["session_id"],
-                     "method": l["method"]}
-                    for l in links
-                ],
+                "checkpoints": [cp] + [
+                    extra_cps[c] for c in sorted(extra_cps)],
+                "links": [dict(l) for l in all_links],
+                "attribution": self._export_attribution(
+                    conn, sorted(cp_ids)),
+                "native_sessions": self._export_native(conn, sid_set),
+                "memory": mem,
             }
         finally:
             conn.close()
+
+    @staticmethod
+    def _export_memory(conn, repo_ids, *, checkpoint=None,
+                       session_ids=None) -> dict:
+        if not repo_ids:
+            return {"version": 1, "documents": [], "symbols": [],
+                    "edges": [], "decisions": [], "runs": [],
+                    "indexes": []}
+        ph = ",".join("?" for _ in repo_ids)
+        docs = [dict(r) for r in conn.execute(
+            "SELECT id,repo_id,kind,source_id,title,text,path,"
+            "line_start,line_end,commit_sha,updated_at,embedding,"
+            "embedding_model,archived FROM memory_documents"
+            f" WHERE repo_id IN ({ph})", repo_ids).fetchall()]
+        decisions = [dict(r) for r in conn.execute(
+            f"SELECT * FROM decisions WHERE repo_id IN ({ph})",
+            repo_ids).fetchall()]
+        runs = []
+        for r in conn.execute(
+                "SELECT id,kind,repo_id,status,created_at,updated_at,"
+                "source_ids,report,details FROM workflow_runs"
+                f" WHERE repo_id IN ({ph})", repo_ids).fetchall():
+            d = dict(r)
+            try:
+                det = json.loads(d["details"])
+            except (ValueError, TypeError):
+                det = None
+            if isinstance(det, dict):
+                # Internal process-ownership bookkeeping (run_owner
+                # and the legacy runner/pid marker) is never exported.
+                d["details"] = canonical_json(_strip_run_details(det))
+            runs.append(d)
+        if checkpoint is not None:
+            keep = set()
+            sids = session_ids or set()
+            for d in docs:
+                if d["kind"] == "decision":
+                    keep.add(d["id"])
+                elif d["kind"] == "checkpoint" and \
+                        d["source_id"] == checkpoint["id"]:
+                    keep.add(d["id"])
+                elif d["kind"] == "session" and \
+                        d["source_id"].split(":", 1)[0] in sids:
+                    keep.add(d["id"])
+                elif d["kind"] == "code" and \
+                        d["commit_sha"] == checkpoint["commit_sha"]:
+                    keep.add(d["id"])
+            cited = set()
+            for dec in decisions:
+                try:
+                    cited.update(json.loads(dec["source_ids"]))
+                except (ValueError, TypeError):
+                    pass
+            for run in runs:
+                try:
+                    cited.update(json.loads(run["source_ids"]))
+                    det = json.loads(run["details"])
+                    for ev in (det.get("evidence") or []):
+                        if isinstance(ev, dict) and ev.get("id"):
+                            cited.add(ev["id"])
+                except (ValueError, TypeError):
+                    pass
+            keep |= cited
+            docs = [d for d in docs if d["id"] in keep]
+        symbols = [dict(r) for r in conn.execute(
+            f"SELECT * FROM graph_symbols WHERE repo_id IN ({ph})",
+            repo_ids).fetchall()]
+        if checkpoint is not None:
+            symbols = [s for s in symbols
+                       if s["commit_sha"] == checkpoint["commit_sha"]]
+        sym_ids = {s["id"] for s in symbols}
+        edges = [dict(r) for r in conn.execute(
+            f"SELECT * FROM graph_edges WHERE repo_id IN ({ph})",
+            repo_ids).fetchall()]
+        if checkpoint is not None:
+            # Unresolved "import:<module>" ghost targets are never
+            # persisted locally and are rejected on import, so they are
+            # never exported either.
+            edges = [e for e in edges
+                     if e["source_id"] in sym_ids
+                     and e["target_id"] in sym_ids]
+        indexes = [dict(r) for r in conn.execute(
+            f"SELECT * FROM repository_indexes WHERE repo_id IN ({ph})",
+            repo_ids).fetchall()]
+        if checkpoint is not None:
+            # A checkpoint bundle only carries the code index when the
+            # recorded index commit is exactly the checkpointed commit;
+            # otherwise the exported code documents are a historical
+            # snapshot and are marked archived so import cannot mistake
+            # them for the receiver's current index.
+            indexes = [i for i in indexes
+                       if i["commit_sha"] == checkpoint["commit_sha"]]
+            if not indexes:
+                for d in docs:
+                    if d["kind"] == "code":
+                        d["archived"] = 1
+        return {"version": 1, "documents": docs, "symbols": symbols,
+                "edges": edges, "decisions": decisions,
+                "runs": runs, "indexes": indexes}
+
+    @staticmethod
+    def _import_memory(conn, memory, known_repos) -> None:
+        if not isinstance(memory, dict):
+            raise ValueError("bundle.memory must be an object")
+        if memory.get("version") != 1:
+            raise ValueError("unsupported bundle.memory version")
+        for name in ("documents", "symbols", "edges", "decisions",
+                     "runs", "indexes"):
+            seq = memory.get(name) or []
+            if not isinstance(seq, list) or len(seq) > 200000:
+                raise ValueError(
+                    f"bundle.memory.{name} must be a bounded list")
+            if not all(isinstance(x, dict) for x in seq):
+                raise ValueError(
+                    f"bundle.memory.{name} entries must be objects")
+
+        def repo_ok(rid):
+            return isinstance(rid, str) and rid in known_repos
+
+        fts_ok = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='memory_fts'"
+        ).fetchone() is not None
+        from .memory import (
+            DOC_KINDS, document_id as _did, _symbol_id as _sid)
+
+        def norm_ts(value, field):
+            if not isinstance(value, str):
+                raise ValueError(f"invalid memory {field}")
+            try:
+                return normalize_timestamp(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid memory {field}") from exc
+
+        incoming_idx = {}
+        for idx in memory.get("indexes") or []:
+            if not repo_ok(idx.get("repo_id")) \
+                    or not _SHA_RE.fullmatch(
+                        str(idx.get("commit_sha") or "")):
+                raise ValueError("invalid repository index record")
+            incoming_idx[idx["repo_id"]] = {
+                "commit_sha": str(idx["commit_sha"]),
+                "indexed_at": norm_ts(
+                    idx.get("indexed_at"), "index timestamp")}
+
+        def index_fresher(repo_id):
+            # The incoming index replaces local code-index state when it
+            # is at least as fresh; a strictly older index leaves the
+            # fresher local graph/index untouched.
+            inc = incoming_idx.get(repo_id)
+            if inc is None:
+                return False
+            row = conn.execute(
+                "SELECT indexed_at FROM repository_indexes"
+                " WHERE repo_id=?", (repo_id,)).fetchone()
+            return row is None \
+                or inc["indexed_at"] >= row["indexed_at"]
+
+        docs = memory.get("documents") or []
+        for d in docs:
+            if not _HEX64_RE.fullmatch(str(d.get("id"))):
+                raise ValueError("invalid memory document id")
+            if not repo_ok(d.get("repo_id")):
+                raise ValueError("memory document references unknown"
+                                 " repository")
+            if d.get("kind") not in DOC_KINDS:
+                raise ValueError("invalid memory document kind")
+            title = d.get("title")
+            text = d.get("text")
+            if not isinstance(title, str) or len(title) > 1000:
+                raise ValueError("invalid memory document title")
+            if not isinstance(text, str) or len(text) > 200000:
+                raise ValueError("invalid memory document text")
+            if has_secret_pattern(title) or has_secret_pattern(text):
+                raise ValueError(
+                    "memory document contains unsanitized secrets")
+            path = d.get("path")
+            if path is not None:
+                if not isinstance(path, str) or len(path) > 1000 \
+                        or not path or path.startswith("/") \
+                        or ".." in path.split("/") \
+                        or path != path.strip():
+                    raise ValueError("invalid memory document path")
+            for key in ("line_start", "line_end"):
+                v = d.get(key)
+                if v is not None and (type(v) is not int
+                                      or not 1 <= v <= 10_000_000):
+                    raise ValueError("invalid memory document lines")
+            if d.get("line_start") is not None \
+                    and d.get("line_end") is not None \
+                    and d["line_end"] < d["line_start"]:
+                raise ValueError("invalid memory document lines")
+            sha = d.get("commit_sha")
+            if sha is not None and not _SHA_RE.fullmatch(str(sha)):
+                raise ValueError("invalid memory document commit")
+            archived = d.get("archived", 0)
+            if type(archived) is not int or archived not in (0, 1):
+                raise ValueError("invalid memory document archived flag")
+            sid = d.get("source_id")
+            if not isinstance(sid, str) or not sid or len(sid) > 200:
+                raise ValueError("invalid memory document source_id")
+            if d["kind"] == "session":
+                if sid.startswith("seed:"):
+                    # Ephemeral seed documents are strictly prefixed,
+                    # single-name, and repo-scoped like any other doc.
+                    if not _SEED_SOURCE_RE.fullmatch(sid):
+                        raise ValueError("invalid seed source_id")
+                else:
+                    sess, sep, eid = sid.partition(":")
+                    if not sep or not eid \
+                            or not _HEX64_RE.fullmatch(sess):
+                        raise ValueError(
+                            "invalid session document source_id")
+                    row = conn.execute(
+                        "SELECT 1 FROM sessions WHERE id=?"
+                        " AND repo_id=?", (sess, d["repo_id"])
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError(
+                            "memory document references unknown"
+                            " session")
+                    if conn.execute(
+                            "SELECT 1 FROM events WHERE session_id=?"
+                            " AND id=?", (sess, eid)).fetchone() is None:
+                        raise ValueError(
+                            "memory document references unknown"
+                            " session event")
+            elif d["kind"] == "checkpoint":
+                if sid.startswith("review:"):
+                    # Ephemeral review documents are strictly prefixed
+                    # "review:<base>..<head>" and carry the head commit.
+                    m = _REVIEW_SOURCE_RE.fullmatch(sid)
+                    if m is None or sha is None \
+                            or sid.rsplit("..", 1)[1] != sha:
+                        raise ValueError("invalid review source_id")
+                else:
+                    if not _HEX32_RE.fullmatch(sid):
+                        raise ValueError(
+                            "invalid checkpoint document source_id")
+                    row = conn.execute(
+                        "SELECT 1 FROM checkpoints WHERE id=?"
+                        " AND repo_id=?", (sid, d["repo_id"])
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError(
+                            "memory document references unknown"
+                            " checkpoint")
+            elif d["kind"] == "code":
+                if not _SHA_RE.fullmatch(sid) or sha is None:
+                    raise ValueError(
+                        "code document requires blob source id and"
+                        " commit sha")
+                if path is None or d.get("line_start") is None \
+                        or d.get("line_end") is None:
+                    raise ValueError(
+                        "code document requires path and lines")
+            elif d["kind"] == "decision":
+                if not _HEX64_RE.fullmatch(sid):
+                    raise ValueError(
+                        "invalid decision document source_id")
+            emb = d.get("embedding")
+            if emb is not None:
+                vec = json.loads(emb) if isinstance(emb, str) else emb
+                if not isinstance(vec, list) or not vec \
+                        or len(vec) > 8192 \
+                        or any(type(x) not in (int, float)
+                               or not math.isfinite(x) for x in vec):
+                    raise ValueError("invalid memory embedding")
+                if d.get("embedding_model") != EMBEDDING_MODEL:
+                    raise ValueError(
+                        "memory embedding model mismatch")
+                emb = canonical_json(vec)
+            elif d.get("embedding_model") is not None:
+                raise ValueError("invalid memory embedding model")
+            expected = _did(
+                d["repo_id"], d["kind"], sid, path, sha,
+                d.get("line_start"), text)
+            if expected != d["id"]:
+                raise ValueError("memory document id mismatch")
+            d["_archived"] = archived
+            d["_emb"] = emb
+            d["_updated"] = norm_ts(
+                d.get("updated_at"), "document timestamp")
+
+        incoming_symbols = memory.get("symbols") or []
+        incoming_edges = memory.get("edges") or []
+        # A fresher (or identical) incoming index atomically archives
+        # the repo's old code documents and replaces only that repo's
+        # graph; a strictly older incoming index leaves the fresher
+        # local state alone.
+        fresher = {rid for rid in incoming_idx if index_fresher(rid)}
+        for rid in fresher:
+            conn.execute(
+                "UPDATE memory_documents SET archived=1"
+                " WHERE repo_id=? AND kind='code' AND archived=0",
+                (rid,))
+            conn.execute(
+                "DELETE FROM graph_symbols WHERE repo_id=?", (rid,))
+            conn.execute(
+                "DELETE FROM graph_edges WHERE repo_id=?", (rid,))
+        for d in docs:
+            archived = d["_archived"]
+            if d["kind"] == "code" and d["repo_id"] in incoming_idx \
+                    and d["repo_id"] not in fresher:
+                archived = 1
+            emb, emb_model = d["_emb"], None
+            if emb is None:
+                prior = conn.execute(
+                    "SELECT embedding,embedding_model FROM"
+                    " memory_documents WHERE id=?", (d["id"],)
+                ).fetchone()
+                if prior is not None and prior["embedding"] is not None:
+                    emb, emb_model = (
+                        prior["embedding"], prior["embedding_model"])
+            else:
+                emb_model = d.get("embedding_model")
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_documents(id,repo_id,"
+                "kind,source_id,title,text,path,line_start,line_end,"
+                "commit_sha,updated_at,embedding,embedding_model,"
+                "archived)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (d["id"], d["repo_id"], d["kind"],
+                 d["source_id"], d["title"], d["text"],
+                 d.get("path"), d.get("line_start"),
+                 d.get("line_end"), d.get("commit_sha"),
+                 d["_updated"], emb, emb_model,
+                 archived))
+            if fts_ok:
+                conn.execute(
+                    "DELETE FROM memory_fts WHERE id=?", (d["id"],))
+                conn.execute(
+                    "INSERT INTO memory_fts(id,repo_id,kind,title,"
+                    "text) VALUES(?,?,?,?,?)",
+                    (d["id"], d["repo_id"], d["kind"],
+                     d["title"], d["text"]))
+        sym_repo: dict[str, str] = {}
+        for s in incoming_symbols:
+            if not repo_ok(s.get("repo_id")) \
+                    or not _HEX64_RE.fullmatch(str(s.get("id"))):
+                raise ValueError("invalid graph symbol")
+            path = s.get("path")
+            if not isinstance(path, str) or len(path) > 1000 \
+                    or not path or path.startswith("/") \
+                    or ".." in path.split("/"):
+                raise ValueError("invalid graph symbol path")
+            name = s.get("name")
+            qname = s.get("qualified_name")
+            if not isinstance(name, str) or not 1 <= len(name) <= 200 \
+                    or not isinstance(qname, str) \
+                    or not 1 <= len(qname) <= 500:
+                raise ValueError("invalid graph symbol name")
+            if has_secret_pattern(name) or has_secret_pattern(qname):
+                raise ValueError("graph symbol contains secrets")
+            if s.get("kind") not in (
+                    "module", "function", "class", "definition"):
+                raise ValueError("invalid graph symbol kind")
+            if s.get("language") not in (
+                    "python", "javascript", "typescript", "go",
+                    "rust", "java"):
+                raise ValueError("invalid graph symbol language")
+            if s.get("analysis") not in ("ast", "lexical"):
+                raise ValueError("invalid graph symbol analysis")
+            if not _SHA_RE.fullmatch(str(s.get("commit_sha") or "")):
+                raise ValueError("invalid graph symbol commit")
+            line, end_line = s.get("line"), s.get("end_line")
+            if type(line) is not int or type(end_line) is not int \
+                    or not 1 <= line <= 10_000_000 \
+                    or not 1 <= end_line <= 10_000_000 \
+                    or end_line < line:
+                raise ValueError("invalid graph symbol lines")
+            if _sid(s["repo_id"], path, qname) != s["id"]:
+                raise ValueError("graph symbol id mismatch")
+            # Graph content only applies when the bundle carries an
+            # index record for the repo that is at least as fresh as
+            # the local one; older graph rows are dropped, never
+            # merged into the fresher local graph.
+            if s["repo_id"] in fresher:
+                conn.execute(
+                    "INSERT OR REPLACE INTO graph_symbols(id,"
+                    "repo_id,path,name,qualified_name,kind,line,"
+                    "end_line,language,analysis,commit_sha)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (s["id"], s["repo_id"], path, name, qname,
+                     s["kind"], line, end_line, s["language"],
+                     s["analysis"], str(s["commit_sha"])))
+                sym_repo[s["id"]] = s["repo_id"]
+        for e in incoming_edges:
+            if not repo_ok(e.get("repo_id")) \
+                    or e.get("kind") not in ("calls", "imports"):
+                raise ValueError("invalid graph edge")
+            src, dst = e.get("source_id"), e.get("target_id")
+            if not isinstance(src, str) or not isinstance(dst, str) \
+                    or not _HEX64_RE.fullmatch(src) \
+                    or not _HEX64_RE.fullmatch(dst):
+                raise ValueError("invalid graph edge endpoint")
+            if e["repo_id"] not in fresher:
+                # Belongs to an older index snapshot: validated above
+                # but never merged into the fresher local graph.
+                continue
+            if sym_repo.get(src) != e["repo_id"] \
+                    or sym_repo.get(dst) != e["repo_id"]:
+                raise ValueError(
+                    "graph edge endpoint missing from same-repo"
+                    " symbols")
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_edges(repo_id,source_id,"
+                "target_id,kind) VALUES(?,?,?,?)",
+                (e["repo_id"], src, dst, e["kind"]))
+        seen_dec = {}
+        for dec in memory.get("decisions") or []:
+            if not repo_ok(dec.get("repo_id")) \
+                    or not _HEX64_RE.fullmatch(str(dec.get("id"))):
+                raise ValueError("invalid decision record")
+            title = dec.get("title")
+            body = dec.get("body")
+            author = dec.get("author")
+            if not isinstance(title, str) or not title.strip() \
+                    or len(title) > 500 \
+                    or not isinstance(body, str) \
+                    or not body.strip() or len(body) > 50000 \
+                    or not isinstance(author, str) \
+                    or not author.strip() or len(author) > 200:
+                raise ValueError("invalid decision fields")
+            if has_secret_pattern(title) or has_secret_pattern(body):
+                raise ValueError(
+                    "decision contains unsanitized secrets")
+            if dec.get("status") not in ("active", "superseded"):
+                raise ValueError("invalid decision status")
+            src = dec.get("source_ids")
+            if isinstance(src, str):
+                try:
+                    src = json.loads(src)
+                except ValueError:
+                    raise ValueError("invalid decision source_ids")
+            if not isinstance(src, list) or len(src) > 200 \
+                    or any(not _HEX64_RE.fullmatch(str(x))
+                           for x in src):
+                raise ValueError("invalid decision source_ids")
+            sup = dec.get("supersedes")
+            if sup is not None and not _HEX64_RE.fullmatch(str(sup)):
+                raise ValueError("invalid decision supersedes")
+            created = norm_ts(
+                dec.get("created_at"), "decision timestamp")
+            existing = conn.execute(
+                "SELECT repo_id,title,body,status FROM decisions"
+                " WHERE id=?", (dec["id"],)).fetchone()
+            if existing is not None:
+                if existing["repo_id"] != dec["repo_id"] \
+                        or existing["title"] != title.strip() \
+                        or existing["body"] != body.strip():
+                    raise ValueError(
+                        "conflicting decision content for existing"
+                        " id")
+            else:
+                conn.execute(
+                    "INSERT INTO decisions(id,repo_id,title,body,"
+                    "status,source_ids,author,created_at,supersedes)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (dec["id"], dec["repo_id"], title.strip(),
+                     body.strip(), dec["status"],
+                     canonical_json(src), author.strip(), created,
+                     sup))
+            seen_dec[dec["id"]] = {
+                "repo_id": dec["repo_id"], "status": dec["status"],
+                "supersedes": sup, "src": src}
+        for did, dec in seen_dec.items():
+            # Status transitions are monotonic: an incoming 'superseded'
+            # marker is applied, but an 'active' claim never resurrects
+            # a locally superseded decision.
+            if dec["status"] == "superseded":
+                conn.execute(
+                    "UPDATE decisions SET status='superseded'"
+                    " WHERE id=? AND repo_id=?",
+                    (did, dec["repo_id"]))
+            sup = dec["supersedes"]
+            if sup is not None:
+                target = conn.execute(
+                    "SELECT repo_id FROM decisions WHERE id=?",
+                    (sup,)).fetchone()
+                if target is None \
+                        or target["repo_id"] != dec["repo_id"]:
+                    raise ValueError(
+                        "decision supersedes unknown or foreign"
+                        " decision")
+                chain, cur = {did}, sup
+                while cur is not None:
+                    if cur in chain:
+                        raise ValueError(
+                            "decision supersession cycle")
+                    chain.add(cur)
+                    row = conn.execute(
+                        "SELECT supersedes FROM decisions WHERE id=?",
+                        (cur,)).fetchone()
+                    cur = row["supersedes"] if row else None
+            for sid2 in dec["src"]:
+                row = conn.execute(
+                    "SELECT repo_id FROM memory_documents WHERE id=?",
+                    (sid2,)).fetchone()
+                if row is None or row["repo_id"] != dec["repo_id"]:
+                    raise ValueError(
+                        "decision source id not in repository")
+        for run in memory.get("runs") or []:
+            if not _HEX64_RE.fullmatch(str(run.get("id"))):
+                raise ValueError("invalid workflow run id")
+            if run.get("kind") not in RUN_KINDS:
+                raise ValueError("invalid workflow run kind")
+            if run.get("status") not in RUN_STATUSES:
+                raise ValueError("invalid workflow run status")
+            if run.get("repo_id") is not None \
+                    and not repo_ok(run["repo_id"]):
+                raise ValueError("invalid workflow run record")
+            src = run.get("source_ids")
+            if isinstance(src, str):
+                try:
+                    src = json.loads(src)
+                except ValueError:
+                    raise ValueError("invalid run source_ids")
+            if not isinstance(src, list) or len(src) > 500 \
+                    or any(not _HEX64_RE.fullmatch(str(x))
+                           for x in src):
+                raise ValueError("invalid run source_ids")
+            report = run.get("report")
+            details = run.get("details")
+            if isinstance(report, str):
+                try:
+                    report = json.loads(report)
+                except ValueError:
+                    raise ValueError("invalid run report")
+            if isinstance(details, str):
+                try:
+                    details = json.loads(details)
+                except ValueError:
+                    raise ValueError("invalid run details")
+            if not isinstance(report, dict) \
+                    or not isinstance(details, dict):
+                raise ValueError("run report/details must be objects")
+            if len(json.dumps(report)) > _RUN_PAYLOAD_MAX \
+                    or len(json.dumps(details)) > _RUN_PAYLOAD_MAX:
+                raise ValueError("run payload too large")
+            evidence = details.get("evidence") or []
+            if not isinstance(evidence, list) or len(evidence) > 500 \
+                    or any(not isinstance(e, dict) for e in evidence):
+                raise ValueError("invalid run evidence")
+            ev_ids = []
+            for e in evidence:
+                eid = e.get("id")
+                if eid is not None:
+                    if not isinstance(eid, str) \
+                            or not _HEX64_RE.fullmatch(eid):
+                        raise ValueError("invalid run evidence id")
+                    ev_ids.append(eid)
+            for did in [*src, *ev_ids]:
+                row = conn.execute(
+                    "SELECT repo_id FROM memory_documents WHERE id=?",
+                    (did,)).fetchone()
+                if row is None:
+                    raise ValueError(
+                        "workflow run cites unknown document")
+                if run.get("repo_id") is not None \
+                        and row["repo_id"] != run["repo_id"]:
+                    raise ValueError(
+                        "workflow run cites foreign document")
+                if run.get("repo_id") is None \
+                        and row["repo_id"] not in known_repos:
+                    raise ValueError(
+                        "workflow run cites foreign workspace")
+            # Imported runs are claims, not local observations: the
+            # stored status is always 'imported' and the claimed status
+            # is preserved alongside.  Process-ownership bookkeeping
+            # (run_owner and the legacy runner/pid marker) is never
+            # trusted from a bundle.
+            details = _strip_run_details(details)
+            details["imported_status"] = run["status"]
+            conn.execute(
+                "INSERT OR IGNORE INTO workflow_runs(id,kind,repo_id,"
+                "status,created_at,updated_at,source_ids,report,"
+                "details) VALUES(?,?,?,?,?,?,?,?,?)",
+                (run["id"], run["kind"], run.get("repo_id"),
+                 "imported",
+                 norm_ts(run.get("created_at"), "run timestamp"),
+                 norm_ts(run.get("updated_at"), "run timestamp"),
+                 canonical_json(src),
+                 canonical_json(redact(report)),
+                 canonical_json(redact(details))))
+        for rid, inc in incoming_idx.items():
+            row = conn.execute(
+                "SELECT indexed_at FROM repository_indexes"
+                " WHERE repo_id=?", (rid,)).fetchone()
+            if row is None or inc["indexed_at"] > row["indexed_at"]:
+                conn.execute(
+                    "INSERT OR REPLACE INTO repository_indexes("
+                    "repo_id,commit_sha,indexed_at) VALUES(?,?,?)",
+                    (rid, inc["commit_sha"], inc["indexed_at"]))
+        for d in docs:
+            if d["kind"] != "decision":
+                continue
+            row = conn.execute(
+                "SELECT repo_id FROM decisions WHERE id=?",
+                (d["source_id"],)).fetchone()
+            if row is None or row["repo_id"] != d["repo_id"]:
+                raise ValueError(
+                    "decision document references unknown decision")
+
+    @staticmethod
+    def _export_attribution(conn, checkpoint_ids) -> list[dict]:
+        if not checkpoint_ids:
+            return []
+        marks = ",".join("?" for _ in checkpoint_ids)
+        rows = conn.execute(
+            "SELECT checkpoint_id,report FROM checkpoint_attribution"
+            f" WHERE checkpoint_id IN ({marks})",
+            checkpoint_ids).fetchall()
+        return [{"checkpoint_id": r["checkpoint_id"],
+                 "report": json.loads(r["report"])} for r in rows]
+
+    @staticmethod
+    def _export_native(conn, session_ids) -> list[dict]:
+        if not session_ids:
+            return []
+        marks = ",".join("?" for _ in session_ids)
+        rows = conn.execute(
+            "SELECT session_id,agent,native_id,format,archive,"
+            "registered_at,source FROM native_sessions"
+            f" WHERE session_id IN ({marks})",
+            session_ids).fetchall()
+        return [{
+            "session_id": r["session_id"], "agent": r["agent"],
+            "native_id": r["native_id"], "format": r["format"],
+            "archive": r["archive"],
+            "registered_at": r["registered_at"],
+            "source": r["source"],
+        } for r in rows]
 
     def export_bundle(self, *, repo_id: str | None = None) -> dict:
         conn = self._connect()
@@ -1080,6 +2400,9 @@ class Store:
                     for c in checkpoints
                 ],
                 "links": [dict(l) for l in links],
+                "attribution": self._export_attribution(conn, cp_ids),
+                "native_sessions": self._export_native(conn, sess_ids),
+                "memory": self._export_memory(conn, repo_ids),
             }
         finally:
             conn.close()
@@ -1137,7 +2460,8 @@ class Store:
         if len(canonical_json(bundle).encode("utf-8")) > MAX_IMPORT_BYTES:
             raise ValueError("bundle exceeds 64 MiB limit")
         for name in ("repositories", "sessions", "events",
-                     "checkpoints", "links"):
+                     "checkpoints", "links", "attribution",
+                     "native_sessions"):
             seq = bundle.get(name)
             if seq is None:
                 continue
@@ -1145,6 +2469,9 @@ class Store:
                 raise ValueError(f"bundle.{name} must be a bounded list")
             if not all(isinstance(x, dict) for x in seq):
                 raise ValueError(f"bundle.{name} entries must be objects")
+        if bundle.get("memory") is not None \
+                and not isinstance(bundle["memory"], dict):
+            raise ValueError("bundle.memory must be an object")
         repos = bundle.get("repositories")
         if repos is not None and not isinstance(repos, list):
             raise ValueError("bundle.repositories must be a list")
@@ -1457,6 +2784,77 @@ class Store:
                         "UPDATE checkpoints SET session_ids=? WHERE id=?",
                         (canonical_json(merged), cid),
                     )
+                session_native = {
+                    row["id"]: row["native_id"]
+                    for row in conn.execute(
+                        "SELECT id,native_id FROM sessions")
+                }
+                for n in bundle.get("native_sessions") or []:
+                    nsid = n.get("session_id")
+                    agent = n.get("agent")
+                    nid = n.get("native_id")
+                    fmt = n.get("format")
+                    if not isinstance(nsid, str) \
+                            or nsid not in session_repo:
+                        raise ValueError(
+                            "native session references unknown session")
+                    if not isinstance(agent, str) \
+                            or agent not in NATIVE_AGENTS:
+                        raise ValueError("invalid native agent")
+                    if not isinstance(nid, str) \
+                            or not _NATIVE_ID_RE.fullmatch(nid):
+                        raise ValueError("invalid native_id")
+                    if session_agent.get(nsid) != agent \
+                            or session_native.get(nsid) != nid:
+                        raise ValueError(
+                            "native identity does not match session")
+                    if fmt != "native-id" \
+                            and fmt != NATIVE_FORMAT_FOR[agent]:
+                        raise ValueError("invalid native format")
+                    archive = n.get("archive")
+                    if archive is not None and (
+                            not isinstance(archive, str)
+                            or len(archive) > 8 * 1024 * 1024):
+                        raise ValueError("invalid native archive")
+                    if archive is not None:
+                        from .native import validate_native_text
+                        afmt, archive = validate_native_text(
+                            agent, nid, archive)
+                        if afmt != fmt:
+                            raise ValueError(
+                                "native archive format mismatch")
+                    registered = _norm_ts_opt(
+                        n.get("registered_at"),
+                        "native registered_at") or now_iso()
+                    existing = conn.execute(
+                        "SELECT local_path,archive,registered_at"
+                        " FROM native_sessions WHERE session_id=?",
+                        (nsid,)).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            "INSERT INTO native_sessions(session_id,"
+                            "agent,native_id,format,local_path,archive,"
+                            "registered_at,source)"
+                            " VALUES(?,?,?,?,NULL,?,?,?)",
+                            (nsid, agent, nid, fmt, archive,
+                             registered, "imported-claim"))
+                    elif registered > (existing["registered_at"] or ""):
+                        conn.execute(
+                            "UPDATE native_sessions SET format=?,"
+                            " archive=COALESCE(?,archive),"
+                            " registered_at=?, source='imported-claim'"
+                            " WHERE session_id=?",
+                            (fmt, archive, registered, nsid))
+                for a in bundle.get("attribution") or []:
+                    rebuilt = _validate_attribution(
+                        conn, a, known_cps, session_repo)
+                    conn.execute(
+                        "INSERT OR IGNORE INTO checkpoint_attribution("
+                        "checkpoint_id,report) VALUES(?,?)",
+                        (a["checkpoint_id"], canonical_json(rebuilt)))
+                if bundle.get("memory") is not None:
+                    self._import_memory(
+                        conn, bundle["memory"], known_repos)
             return {
                 "repositories": len(repos),
                 "sessions": len(sessions),

@@ -29,9 +29,17 @@ _PEM_RE = re.compile(
     r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----",
     re.DOTALL,
 )
+# A value that is exactly the REDACTED placeholder (bare or quoted) is
+# output produced by _redact_text itself, not a secret. Excluding it
+# from the assignment match keeps redact() a fixpoint and lets redacted
+# documents pass has_secret_pattern() on import instead of failing as
+# "unsanitized secrets" (which can wedge sync --pull).
+_REDACTED_VALUE = re.escape(REDACTED)
 _ASSIGN_RE = re.compile(
     r"(?i)\b(PASSWORD|TOKEN|SECRET|API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH(?:ORIZATION)?)"
     r"(\s*[:=]\s*)"
+    rf"(?!{_REDACTED_VALUE}(?=[\s,;\"']|$))"
+    rf"(?!\"{_REDACTED_VALUE}\"|'{_REDACTED_VALUE}')"
     r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;\"']+)"
 )
 
@@ -72,6 +80,15 @@ def redact(value: object) -> object:
     if isinstance(value, str):
         return _redact_text(value)
     return value
+
+
+def has_secret_pattern(text: object) -> bool:
+    if not isinstance(text, str):
+        return False
+    return any(
+        rx.search(text) for rx in
+        (_PEM_RE, _BEARER_RE, _SK_RE, _GH_RE, _GH_PAT_RE, _AWS_RE,
+         _ASSIGN_RE))
 
 
 def is_sensitive_path(path: str) -> bool:

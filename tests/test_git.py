@@ -482,6 +482,60 @@ class SyncTests(RepoTestCase):
         git(repo, "-c", "user.name=T", "-c", "user.email=t@e",
             "commit", "-m", "c")
 
+    def test_push_pull_native_and_attribution(self):
+        from partial.native import register_native
+        from partial.provenance import Provenance
+        uid = "12345678-1234-1234-1234-1234567890ab"
+        sid = scoped_session_id(self.rid, "codex", uid)
+        self.store.ingest(self.rid, [Event(
+            id="cs1", session_id=uid, agent="codex",
+            kind="session_start", timestamp=TS)], worktree=self.wt)
+        f = self.tmp / "rollout.jsonl"
+        f.write_text(
+            '{"type":"session_meta","payload":{"id":"' + uid + '",'
+            '"cwd":"/repo","timestamp":"2026-09-16T09:00:00.000Z"}}\n'
+            '{"type":"response_item","payload":{"type":"message",'
+            '"role":"user","content":[{"type":"input_text",'
+            '"text":"hi"}]}}\n')
+        register_native(
+            self.store, {**self.grepo, "id": self.rid}, "codex", uid,
+            path=f, archive=True)
+        self.add_commit("f.py", "a\n")
+        prov = Provenance(self.store)
+        p = {"session_id": uid, "tool_name": "edit",
+             "tool_input": {"file_path": "f.py"},
+             "tool_use_id": "c1", "tool_response": {"success": True}}
+        prov.before_tool(self.grepo, "codex", p)
+        (Path(self.repo) / "f.py").write_text("a\nb\n")
+        prov.after_tool(self.grepo, "codex", p)
+        git(self.repo, "add", "--", "f.py")
+        commit(self.repo, "attr")
+        cp = create_checkpoint(
+            self.store, self.rid, session_ids=[sid], worktree=self.wt)
+        persist_checkpoint(
+            self.grepo, self.store.checkpoint_bundle(cp["id"]),
+            cp["id"])
+        res = sync_checkpoints(self.store, self.grepo, push=True)
+        self.assertTrue(res["pushed"], res)
+        other = init_repo(self.tmp / "clone")
+        git(other, "remote", "add", "origin", str(self.bare))
+        self.add_commit_in(other, "z.py", "z = 9\n")
+        orepo = discover_repo(other)
+        store2 = Store(self.tmp / "home2" / "partial.db")
+        store2.register_repo(other)
+        res2 = sync_checkpoints(store2, orepo, pull=True)
+        self.assertEqual(res2["pulled"], 1, res2)
+        n2 = store2.get_native(sid)
+        self.assertIsNotNone(n2)
+        self.assertEqual(n2["format"], "codex-rollout")
+        self.assertEqual(n2["source"], "imported-claim")
+        self.assertIsNone(n2["local_path"])
+        self.assertIsNotNone(n2["archive"])
+        att2 = store2.get_attribution(cp["id"])
+        self.assertIsNotNone(att2)
+        self.assertEqual(att2["capture_source"], "imported-claim")
+        self.assertEqual(att2["summary"]["agent_added"], 1)
+
     def test_pull_divergence_merges_union(self):
         cp_a = self._make_checkpoint(
             [prompt_event("pa", "s1", "alpha transcript")])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 
@@ -114,8 +115,8 @@ def create_demo_store() -> Store:
         "+++ b/tests/test_auth.py\n"
         "@@ -88,3 +88,12 @@ def test_refresh_rotates_token():\n"
         "+def test_expired_access_token_rejected():\n"
-        "+    token = issue_token(ttl=-1)\n"
-        "+    assert not validate_access(token)\n"
+        "+    issued = issue_token(ttl=-1)\n"
+        "+    assert not validate_access(issued)\n"
     )
     diff_palette = (
         "diff --git a/src/ui/palette.ts b/src/ui/palette.ts\n"
@@ -160,4 +161,75 @@ def create_demo_store() -> Store:
                 "observed-worktree-overlap")],
         worktree=None, created_at=_ts(8, 0),
     )
+
+    from .memory import Memory, document_id
+    mem = Memory(store)
+    mem.index(None)
+    conn = store._connect()
+    try:
+        # Synthetic Python sample derived from the demo diff text;
+        # not live repository content. The source_id is the real git
+        # blob SHA-1 of this content and commit_sha/lines match the
+        # indexed-file shape so the document satisfies the bundle
+        # import invariants for code documents.
+        code = (
+            "def activity_feed(request):\n"
+            "    limit = min(requested_limit, 100)\n"
+            "    cursor = request.args.get('cursor')\n"
+            "    return render(request, 'feed.html')\n")
+        code_bytes = code.encode("utf-8")
+        blob = hashlib.sha1(
+            b"blob %d\0" % len(code_bytes) + code_bytes).hexdigest()
+        csha = sha256_hex("partial-demo:commit:1")[:40]
+        did = document_id(orbit, "code", blob,
+                          "src/routes/activity.py", csha, 1, code)
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_documents(id,repo_id,"
+            "kind,source_id,title,text,path,line_start,line_end,"
+            "commit_sha,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (did, orbit, "code", blob,
+             "src/routes/activity.py (synthetic demo)", code,
+             "src/routes/activity.py", 1, 4, csha,
+             "2026-09-16T09:10:00.000000Z"))
+        conn.execute(
+            "INSERT OR REPLACE INTO repository_indexes(repo_id,"
+            "commit_sha,indexed_at) VALUES(?,?,?)",
+            (orbit, csha, "2026-09-16T09:10:00.000000Z"))
+        if getattr(store, "fts_ok", True):
+            conn.execute(
+                "INSERT INTO memory_fts(id,repo_id,kind,title,text)"
+                " VALUES(?,?,?,?,?)",
+                (did, orbit, "code",
+                 "src/routes/activity.py (synthetic demo)", code))
+        from .memory import _symbol_id
+        mod = _symbol_id(orbit, "src/routes/activity.py",
+                         "src.routes.activity")
+        fn = _symbol_id(orbit, "src/routes/activity.py",
+                        "activity_feed")
+        for sid_, name, qn, kind in (
+                (mod, "src.routes.activity", "src.routes.activity",
+                 "module"),
+                (fn, "activity_feed", "activity_feed", "function")):
+            conn.execute(
+                "INSERT OR REPLACE INTO graph_symbols(id,repo_id,"
+                "path,name,qualified_name,kind,line,end_line,"
+                "language,analysis,commit_sha)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (sid_, orbit, "src/routes/activity.py", name, qn,
+                 kind, 1, 4, "python", "ast", csha))
+        conn.commit()
+        cp_doc = conn.execute(
+            "SELECT id FROM memory_documents WHERE kind='checkpoint'"
+            " AND source_id=?",
+            (sha256_hex("partial-demo:checkpoint:1")[:32],)
+        ).fetchone()
+    finally:
+        conn.close()
+    if cp_doc:
+        mem.add_decision(
+            orbit,
+            "Cursor pagination for the activity feed",
+            "Use stable cursors instead of page numbers; cap the"
+            " requested page size at 100.",
+            [cp_doc["id"]], author="Partial Demo")
     return store

@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 from partial.demo import create_demo_store
 from partial.git import create_checkpoint
 from partial.models import Event, scoped_session_id
+from partial.provenance import Provenance
 from partial.server import create_server
 from partial.store import Store
 
@@ -56,13 +57,33 @@ def build_auth_store(path):
     sid0 = scoped_session_id(rid, "devin", "s0")
     cp = create_checkpoint(store, rid, session_ids=[sid0],
                            worktree=str(root))
+    rd = {"id": rid, "root": str(root),
+          "common_dir": str(root / ".git"), "remote": ""}
+    prov = Provenance(store)
+    payload = {"session_id": "s0", "tool_name": "edit",
+               "tool_input": {"file_path": "f.py"},
+               "tool_use_id": "call-1",
+               "tool_response": {"success": True}}
+    prov.before_tool(rd, "devin", payload)
+    (root / "f.py").write_text("x = 1\ny = 2\n")
+    prov.after_tool(rd, "devin", payload)
+    (root / "f.py").write_text("x = 1\ny = 2\nz = 3\n")
+    (root / "h.py").write_text("mystery = 1\n")
+    subprocess.run(["git", "-C", str(root), "add", "-A"],
+                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=T",
+         "-c", "user.email=t@e", "commit", "-m", "attributed"],
+        check=True, capture_output=True)
+    cp2 = create_checkpoint(store, rid, session_ids=[sid0],
+                            worktree=str(root))
     evil = ("<img src=x onerror=window.__pwned=1>"
             " marker-dangerous-text")
     store.ingest(
         rid,
         [_ev("evil1", "evil-s", evil)],
         worktree=str(root))
-    return store, rid, cp["id"]
+    return store, rid, cp["id"], cp2["id"]
 
 
 class Server:
@@ -89,8 +110,8 @@ class Smoke(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.auth_store, cls.rid, cls.cpid = build_auth_store(
-            Path(cls.tmp.name) / "auth.db")
+        cls.auth_store, cls.rid, cls.cpid, cls.acpid = \
+            build_auth_store(Path(cls.tmp.name) / "auth.db")
         cls.demo_store = create_demo_store()
         cls.auth = Server(cls.auth_store)
         cls.demo = Server(cls.demo_store, demo=True)
@@ -506,7 +527,12 @@ class Smoke(unittest.TestCase):
             seen["ws"] = route.request.headers.get(
                 "x-partial-workspace")
             release.wait(10)
-            route.continue_()
+            try:
+                route.continue_()
+            except Exception:
+                # the page aborts in-flight requests on workspace
+                # switch; the header was still captured above
+                pass
 
         page.route("**/api/bundles", hold)
         page.goto(self.auth.base + "/app#/integrations")
@@ -568,6 +594,418 @@ class Smoke(unittest.TestCase):
         self.assertEqual(
             owner_row.locator("button", has_text="Remove").count(),
             0)
+        ctx.close()
+
+    def test_15_attribution_card_and_badges(self):
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(
+            self.auth.base + f"/app#/checkpoints/{self.acpid}")
+        page.wait_for_selector(".attr-card")
+        text = page.locator(".attr-card").inner_text()
+        self.assertIn("AI attribution estimate", text)
+        self.assertIn("agent share 33.33%", text)
+        self.assertIn("coverage 66.67%", text)
+        self.assertNotIn("100%", text)
+        self.assertIn("local observation", text)
+        labels = page.locator(".attr-badge").all_inner_texts()
+        self.assertIn("AI", labels)
+        self.assertIn("HU", labels)
+        self.assertIn("?", labels)
+        det = page.locator(".attr-card details summary")
+        det.click()
+        rows = page.locator(".attr-card table tr").all_inner_texts()
+        joined = "\n".join(rows)
+        self.assertIn("f.py", joined)
+        self.assertIn("h.py", joined)
+        self.assertIn("tool-pair", joined)
+        self.assertIn("external", joined)
+        ctx.close()
+
+    def test_16_memory_pages(self):
+        ctx, page = self.page()
+        # demo workspace: memory pre-indexed, read-only
+        page.goto(self.demo.base + "/app#/memory?q=pagination")
+        page.wait_for_selector("table.list")
+        self.assertIn("result(s)", page.locator("#view").inner_text())
+        page.locator('#view table a[href="#/memory"]').first.click()
+        page.wait_for_selector(".doc-overlay")
+        self.assertIn("cursor pagination",
+                      page.locator(".doc-overlay").inner_text().lower())
+        page.locator(".doc-overlay button").first.click()
+
+        page.goto(self.demo.base + "/app#/graph?q=activity_feed")
+        page.wait_for_selector("table.list")
+        self.assertIn("activity_feed",
+                      page.locator("#view").inner_text())
+        page.locator('a[href^="#/graph?symbol="]').first.click()
+        page.wait_for_selector("text=analysis")
+
+        page.goto(self.demo.base + "/app#/decisions")
+        page.wait_for_selector(
+            "text=Cursor pagination for the activity feed")
+        self.assertIn("read-only",
+                      page.locator("#view").inner_text().lower())
+
+        page.goto(self.demo.base + "/app#/dispatch")
+        page.wait_for_selector("pre.code-view")
+        self.assertIn("cursor pagination",
+                      page.locator("#view").inner_text().lower())
+        ctx.close()
+
+        # auth workspace: index via API, then use UI
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        acc = self.auth.srv.partial_context.accounts
+        raw, _p = acc.login(EMAIL, PASSWORD)
+        st, _ = self.api("POST", "/api/memory/index", {},
+                         cookie=raw)
+        self.assertEqual(st, 200)
+        st, _ = self.api("POST", "/api/workflows",
+                         {"kind": "ask", "query": "what changed",
+                          "run": False},
+                         cookie=raw)
+        self.assertEqual(st, 200)
+        page.goto(self.auth.base + "/app#/memory?q=filler")
+        page.wait_for_selector("table.list")
+        page.goto(self.auth.base + "/app#/workflows")
+        page.wait_for_selector("table.list")
+        self.assertIn("planned",
+                      page.locator("#view").inner_text())
+        page.locator('a[href^="#/workflows/"]').first.click()
+        page.wait_for_selector("pre.code-view")
+        # decision creation via UI
+        page.goto(self.auth.base + "/app#/decisions")
+        page.wait_for_selector("text=Record a decision")
+        page.fill('input[placeholder="Title"]', "Keep stdlib only")
+        page.fill('textarea[placeholder="Body"]', "No new deps.")
+        page.click("button:has-text('Record decision')")
+        page.wait_for_selector("text=[active] Keep stdlib only")
+        ctx.close()
+
+    def test_17_memory_overlay_lifecycle(self):
+        acc = self.auth.srv.partial_context.accounts
+        raw, _p = acc.login(EMAIL, PASSWORD)
+        st, me = self.api("GET", "/api/me", cookie=raw)
+        self.assertEqual(st, 200)
+        ws1 = me["workspace"]["id"]
+        st, _ = self.api("POST", "/api/memory/index", {},
+                         cookie=raw)
+        self.assertEqual(st, 200)
+        # supersede a decision so an archived document exists
+        st, d = self.api(
+            "POST", "/api/decisions",
+            {"repo_id": self.rid, "title": "Old call",
+             "body": "first"}, cookie=raw)
+        self.assertEqual(st, 201, d)
+        old_dec = d["item"]["id"]
+        st, d = self.api(
+            "POST", "/api/decisions",
+            {"repo_id": self.rid, "title": "New call",
+             "body": "second", "supersedes": old_dec}, cookie=raw)
+        self.assertEqual(st, 201, d)
+        conn = self.auth_store._connect()
+        try:
+            row = conn.execute(
+                "SELECT id FROM memory_documents"
+                " WHERE archived=1 LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        archived_doc = row["id"]
+        # second workspace must exist before login so it appears in
+        # the workspace switcher rendered at boot
+        st, ws2 = self.api("POST", "/api/workspaces",
+                           {"name": "ws-overlay"}, cookie=raw)
+        self.assertEqual(st, 201, ws2)
+        ws2 = ws2["item"]["id"]
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/memory?q=filler")
+        page.wait_for_selector("table.list")
+        text = page.locator("#view").inner_text()
+        self.assertIn("does not scan the filesystem", text)
+        self.assertTrue(page.locator(
+            "button:has-text('Index captured history')")
+            .is_visible())
+        # semantic toggle only when provider+policy allow it
+        self.assertIn("Semantic search unavailable", text)
+        self.assertEqual(page.locator(
+            "input[aria-label='Semantic search']").count(), 0)
+        # kind tabs present
+        tabs = page.locator(".tabs [role=tab]")
+        self.assertEqual(tabs.count(), 5)
+        tabs.filter(has_text="Sessions").click()
+        page.wait_for_function(
+            "location.hash.includes('kind=session')")
+        page.wait_for_selector("table.list")
+
+        # open overlay, check dialog semantics + Escape + focus
+        link = page.locator('#view table a[href="#/memory"]').first
+        link.click()
+        page.wait_for_selector(".doc-overlay")
+        ov = page.locator(".doc-overlay")
+        self.assertEqual(ov.get_attribute("role"), "dialog")
+        self.assertEqual(ov.get_attribute("aria-modal"), "true")
+        page.keyboard.press("Escape")
+        page.wait_for_selector(".doc-overlay", state="detached")
+        self.assertEqual(
+            page.evaluate("document.activeElement.tagName"), "A")
+
+        # archived doc still opens by id
+        page.fill("input[aria-label='Open document by id']",
+                  archived_doc)
+        page.click("button:has-text('Open doc')")
+        page.wait_for_selector(".doc-overlay")
+        self.assertIn("Old call",
+                      page.locator(".doc-overlay").inner_text())
+        # only one overlay at a time
+        page.keyboard.press("Escape")
+        page.wait_for_selector(".doc-overlay", state="detached")
+        page.locator('#view table a[href="#/memory"]').first.click()
+        page.wait_for_selector(".doc-overlay")
+        self.assertEqual(page.locator(".doc-overlay").count(), 1)
+
+        # workspace switch removes the overlay
+        page.locator("#ws-select").select_option(ws2)
+        page.wait_for_selector("text=Every change has a story")
+        self.assertEqual(page.locator(".doc-overlay").count(), 0)
+        self.assertIn("No sessions captured",
+                      page.locator("#view").inner_text())
+        # switch back, open overlay, logout removes it
+        page.locator("#ws-select").select_option(ws1)
+        page.wait_for_selector("text=Every change has a story")
+        page.goto(self.auth.base + "/app#/memory?q=filler")
+        page.wait_for_selector("table.list")
+        page.locator('#view table a[href="#/memory"]').first.click()
+        page.wait_for_selector(".doc-overlay")
+        page.locator("#logout-btn").dispatch_event("click")
+        page.wait_for_selector("#login:not([hidden])")
+        self.assertEqual(page.locator(".doc-overlay").count(), 0)
+        ctx.close()
+
+    def test_18_memory_error_state(self):
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.route("**/api/memory/search*",
+                   lambda route: route.abort())
+        page.goto(self.auth.base + "/app#/memory?q=filler")
+        page.wait_for_selector("text=Could not load")
+        page.unroute("**/api/memory/search*")
+        ctx.close()
+
+    def test_19_graph_neighbors_impact(self):
+        # give the demo graph one real edge so tables render
+        from partial.memory import _symbol_id
+        from partial.models import sha256_hex
+        orbit = sha256_hex("partial-demo:orbit-api")
+        mod = _symbol_id(orbit, "src/routes/activity.py",
+                         "src.routes.activity")
+        fn = _symbol_id(orbit, "src/routes/activity.py",
+                        "activity_feed")
+        conn = self.demo_store._connect()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_edges(repo_id,"
+                "source_id,target_id,kind) VALUES(?,?,?,?)",
+                (orbit, fn, mod, "calls"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        ctx, page = self.page()
+        page.goto(self.demo.base + "/app#/graph?q=activity_feed")
+        page.wait_for_selector("table.list")
+        self.assertIn("lexical inventory",
+                      page.locator("#view").inner_text())
+        page.locator('a[href^="#/graph?symbol="]').first.click()
+        page.wait_for_selector("text=analysis")
+        text = page.locator("#view").inner_text()
+        self.assertIn("Neighbor nodes", text)
+        self.assertIn("src.routes.activity", text)
+        self.assertIn("calls", text)
+        self.assertIn("static analysis only", text)
+
+        # impact on the module shows the caller-side table
+        page.goto(self.demo.base + "/app#/graph?q=src.routes")
+        page.wait_for_selector("table.list")
+        page.locator("button:has-text('impact')").first.click()
+        page.wait_for_selector(".impact-panel table.list")
+        self.assertIn("activity_feed",
+                      page.locator(".impact-panel").inner_text())
+        self.assertIn("incoming edges only",
+                      page.locator(".impact-panel").inner_text())
+
+        # impact on a symbol with no callers shows an empty state
+        page.goto(self.demo.base + "/app#/graph?q=activity_feed")
+        page.wait_for_selector("table.list")
+        page.locator("button:has-text('impact')").first.click()
+        page.wait_for_selector(".impact-panel")
+        self.assertIn("No caller-side symbols",
+                      page.locator(".impact-panel").inner_text())
+        ctx.close()
+
+    def test_20_dispatch_preview(self):
+        ctx, page = self.page()
+        page.goto(self.demo.base + "/app#/dispatch")
+        page.wait_for_selector("pre.code-view")
+        text = page.locator("#view").inner_text()
+        self.assertIn("Deterministic recap", text)
+        self.assertIn("no AI call", text)
+        self.assertIn("cursor pagination", text.lower())
+        self.assertTrue(page.locator(
+            "button:has-text('Copy')").first.is_visible())
+        dl = page.locator("a[download]")
+        self.assertTrue(dl.is_visible())
+        self.assertEqual(dl.get_attribute("download"),
+                         "partial-dispatch.md")
+        page.locator(
+            "summary:has-text('Source checkpoints')").click()
+        self.assertTrue(page.locator(
+            'a[href^="#/checkpoints/"]').first.is_visible())
+
+        page.goto(self.auth.base + "/app#/dispatch")
+        page.wait_for_selector("#login:not([hidden])")
+        ctx.close()
+
+        # empty window shows the empty state
+        ctx, page = self.page()
+        page.goto(self.demo.base +
+                  "/app#/dispatch?since=2026-09-01&until=2026-09-02")
+        page.wait_for_selector("text=No checkpoints recorded")
+        self.assertIn("2026-09-01",
+                      page.locator("#view").inner_text())
+        ctx.close()
+
+    def test_21_workflow_states(self):
+        acc = self.auth.srv.partial_context.accounts
+        raw, _p = acc.login(EMAIL, PASSWORD)
+        st, _ = self.api("POST", "/api/memory/index", {},
+                         cookie=raw)
+        self.assertEqual(st, 200)
+        # plan review/investigate via API — evidence packet only
+        for kind in ("review", "investigate"):
+            st, d = self.api(
+                "POST", "/api/workflows",
+                {"kind": kind, "query": "check it", "run": False},
+                cookie=raw)
+            self.assertEqual(st, 200, d)
+            self.assertEqual(d["status"], "planned")
+        # force an error run locally — no provider configured
+        from partial.workflows import run_workflow
+        try:
+            run_workflow(self.auth_store, "ask",
+                         query="will fail", run=True)
+        except ValueError:
+            pass
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/workflows")
+        page.wait_for_selector("table.list")
+        text = page.locator("#view").inner_text()
+        self.assertIn("planned", text)
+        self.assertIn("error", text)
+        self.assertIn("no agents run on this server",
+                      text.lower())
+        # run checkbox is gated without provider/policy
+        self.assertTrue(page.locator(
+            "input[aria-label='Run with AI provider']")
+            .is_disabled())
+
+        # error run detail shows a visible error
+        page.locator('a[href^="#/workflows/"]').first.click()
+        page.wait_for_selector("#view .notice-err")
+        self.assertIn("external AI disabled",
+                      page.locator("#view").inner_text())
+        self.assertIn("the run failed",
+                      page.locator("#view").inner_text())
+
+        # plan a workflow via the UI (no confirmation needed)
+        page.goto(self.auth.base + "/app#/workflows")
+        page.wait_for_selector("table.list")
+        before = page.locator('a[href^="#/workflows/"]').count()
+        page.select_option("select[aria-label='Workflow kind']",
+                           "investigate")
+        page.fill("input[aria-label='Workflow question']",
+                  "filler")
+        page.locator("#view button:has-text('Submit')").click()
+        page.wait_for_selector("#errbar.show")
+        self.assertIn("planned",
+                      page.locator("#errbar").inner_text())
+        links = page.locator('#view a[href^="#/workflows/"]')
+        for _ in range(50):
+            if links.count() == before + 1:
+                break
+            page.wait_for_timeout(100)
+        self.assertEqual(links.count(), before + 1)
+        page.locator('a[href^="#/workflows/"]').first.click()
+        page.wait_for_selector("pre.code-view")
+        text = page.locator("#view").inner_text()
+        self.assertIn("planned", text)
+        self.assertIn("no external request was made", text)
+        self.assertIn("evidence:", text)
+        ctx.close()
+
+    def test_22_project_groups(self):
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/repos")
+        page.wait_for_selector(
+            "input[aria-label='New project name']")
+        self.assertIn("trust boundary",
+                      page.locator("#view").inner_text())
+        page.fill("input[aria-label='New project name']",
+                  "Smoke Group")
+        page.locator(
+            "#view button:has-text('Create project')").click()
+        page.wait_for_selector("text=Smoke Group")
+        page.select_option("select[aria-label='Project']",
+                           label="Smoke Group")
+        page.locator(
+            "#view button:has-text('Attach repository')").click()
+        page.wait_for_timeout(400)
+        acc = self.auth.srv.partial_context.accounts
+        raw, _p = acc.login(EMAIL, PASSWORD)
+        st, d = self.api("GET", "/api/projects", cookie=raw)
+        self.assertEqual(st, 200)
+        grp = [p for p in d["items"] if p["name"] == "Smoke Group"]
+        self.assertEqual(len(grp), 1)
+        self.assertIn(self.rid, grp[0]["repos"])
+        ctx.close()
+
+    def test_23_mobile_memory_pages(self):
+        ctx, page = self.page(375)
+        for frag in ("memory?q=pagination", "graph?q=activity_feed",
+                     "decisions", "dispatch", "workflows"):
+            page.goto(self.demo.base + f"/app#/{frag}")
+            page.wait_for_timeout(500)
+            self.assertTrue(no_x_scroll(page),
+                            f"overflow on {frag}")
+        # sidebar opens, footer/sign-out reachable, Escape closes
+        page.goto(self.demo.base + "/app#/overview")
+        page.wait_for_timeout(300)
+        page.click("#menubtn")
+        self.assertTrue(page.locator("#sidebar.open").is_visible())
+        self.assertTrue(page.locator("#sidebar .foot").is_visible())
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        self.assertFalse(
+            page.locator("#sidebar").evaluate(
+                "e => e.classList.contains('open')"))
+        page.screenshot(path="/tmp/partial-final-mobile-memory.png")
+        ctx.close()
+
+        # overlay is usable at 375px
+        ctx, page = self.page(375)
+        page.goto(self.demo.base + "/app#/memory?q=pagination")
+        page.wait_for_selector("table.list")
+        page.locator('#view table a[href="#/memory"]').first.click()
+        page.wait_for_selector(".doc-overlay")
+        self.assertTrue(no_x_scroll(page), "overflow on overlay")
+        page.keyboard.press("Escape")
+        page.wait_for_selector(".doc-overlay", state="detached")
         ctx.close()
 
     def test_99_no_console_errors(self):

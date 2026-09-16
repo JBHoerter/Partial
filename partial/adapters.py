@@ -137,7 +137,8 @@ def codex_event(payload: dict, session_id: str) -> list[Event]:
         return [Event(
             id=_det_id("codex", {"t": ptype, "u": usage, "s": sid}),
             session_id=sid, agent="codex", kind="usage",
-            timestamp=ts, data=redact({"usage": usage}),
+            timestamp=ts, data=redact(
+                {"usage": usage, "usage_scope": "delta"}),
         )]
     if ptype == "item.started":
         return []
@@ -233,12 +234,24 @@ def _import_canonical(obj: dict) -> list[Event]:
     return out
 
 
-def _import_devin_atif(obj: dict, session_id: str | None) -> list[Event]:
-    steps = obj.get("steps")
-    if not isinstance(steps, list):
-        raise ValueError("ATIF import requires a steps array")
-    sid = session_id or str(obj.get("session_id") or "") or \
-        "devin-import-" + sha256_hex(canonical_json(obj))[:24]
+def _atif_text(message: object) -> str:
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        parts = []
+        for p in message:
+            if isinstance(p, dict):
+                if p.get("type") in ("text", "input_text", "output_text") \
+                        and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+            elif isinstance(p, str) and p:
+                parts.append(p)
+        return "\n".join(parts)
+    return ""
+
+
+def _atif_steps(steps: list, sid: str, parent: str | None,
+              model_default: str | None) -> list[Event]:
     out: list[Event] = []
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
@@ -246,35 +259,141 @@ def _import_devin_atif(obj: dict, session_id: str | None) -> list[Event]:
         ts = _ts(step)
         base = {"s": sid, "i": i, "step": step}
         source = str(step.get("source") or "").lower()
-        message = step.get("message")
-        if isinstance(message, str) and message:
-            kind = "prompt" if source in ("user", "human") else "response"
+        model = model_default
+        if isinstance(step.get("model_name"), str) \
+                and step["model_name"]:
+            model = step["model_name"]
+        text = _atif_text(step.get("message"))
+        if text:
+            if source in ("user", "human"):
+                kind = "prompt"
+            elif source == "system":
+                kind = "system"
+            else:
+                kind = "response"
             out.append(Event(
                 id=_det_id("devin", {**base, "k": kind}),
                 session_id=sid, agent="devin", kind=kind, timestamp=ts,
-                text=message,
+                text=text, parent_session_id=parent,
+                model=model if source == "agent" else None,
             ))
         calls = step.get("tool_calls") or []
         if isinstance(calls, list):
             for j, call in enumerate(calls):
                 if not isinstance(call, dict):
                     continue
-                name = call.get("name") or call.get("function_name") or "tool"
-                args = call.get("arguments") or call.get("input")
+                name = call.get("function_name") or call.get("name") \
+                    or "tool"
+                args = call.get("arguments")
+                if args is None:
+                    args = call.get("input")
                 out.append(Event(
                     id=_det_id("devin", {**base, "k": "tool", "j": j}),
-                    session_id=sid, agent="devin", kind="tool", timestamp=ts,
-                    tool_name=str(name),
-                    data=redact({"tool_input": args}),
+                    session_id=sid, agent="devin", kind="tool",
+                    timestamp=ts, tool_name=str(name),
+                    parent_session_id=parent,
+                    data=redact({
+                        "tool_input": args,
+                        "tool_call_id": call.get("tool_call_id")
+                        or call.get("id"),
+                    }),
                 ))
         obs = step.get("observation")
-        if obs:
+        results = None
+        if isinstance(obs, dict):
+            results = obs.get("results")
+        elif isinstance(obs, list):
+            results = obs
+        if isinstance(results, list):
+            for j, r in enumerate(results):
+                if not isinstance(r, dict):
+                    continue
+                out.append(Event(
+                    id=_det_id(
+                        "devin", {**base, "k": "tool_result", "j": j}),
+                    session_id=sid, agent="devin", kind="tool",
+                    timestamp=ts, tool_name="tool_result",
+                    parent_session_id=parent,
+                    data=redact({
+                        "tool_response": {"content": r.get("content")},
+                        "source_call_id": r.get("source_call_id"),
+                    }),
+                ))
+        elif obs:
             out.append(Event(
                 id=_det_id("devin", {**base, "k": "observation"}),
                 session_id=sid, agent="devin", kind="tool", timestamp=ts,
-                tool_name="observation",
+                tool_name="observation", parent_session_id=parent,
                 data=redact({"tool_response": {"output": obs}}),
             ))
+        metrics = step.get("metrics")
+        if isinstance(metrics, dict) \
+                and not step.get("is_copied_context"):
+            usage: dict = {}
+            if "prompt_tokens" in metrics:
+                usage["input_tokens"] = metrics["prompt_tokens"]
+            if "completion_tokens" in metrics:
+                usage["output_tokens"] = metrics["completion_tokens"]
+            if "cached_tokens" in metrics:
+                usage["cached_input_tokens"] = metrics["cached_tokens"]
+            if usage:
+                out.append(Event(
+                    id=_det_id("devin", {**base, "k": "usage"}),
+                    session_id=sid, agent="devin", kind="usage",
+                    timestamp=ts, parent_session_id=parent,
+                    data=redact({
+                        "usage": usage, "usage_scope": "delta",
+                        "usage_id": step.get("step_id"),
+                    }),
+                ))
+    return out
+
+
+def _import_devin_atif(obj: dict, session_id: str | None) -> list[Event]:
+    steps = obj.get("steps")
+    if not isinstance(steps, list):
+        raise ValueError("ATIF import requires a steps array")
+    sid = session_id or str(obj.get("session_id") or "") or \
+        "devin-import-" + sha256_hex(canonical_json(obj))[:24]
+    agent_meta = obj.get("agent")
+    model_default = None
+    if isinstance(agent_meta, dict) and isinstance(
+            agent_meta.get("model_name"), str):
+        model_default = agent_meta["model_name"]
+    out = _atif_steps(steps, sid, None, model_default)
+    seen_traj: set = set()
+
+    def walk(traj: dict, parent_sid: str, depth: int) -> None:
+        if depth > 16:
+            raise ValueError(
+                "ATIF subagent trajectory nesting exceeds depth 16")
+        tid = traj.get("trajectory_id") or traj.get("id")
+        if not isinstance(tid, str) or not tid:
+            return
+        if tid in seen_traj:
+            raise ValueError(f"duplicate trajectory id: {tid}")
+        seen_traj.add(tid)
+        mdl = model_default
+        a = traj.get("agent")
+        if isinstance(a, dict) and isinstance(a.get("model_name"), str) \
+                and a["model_name"]:
+            mdl = a["model_name"]
+        child_steps = traj.get("steps")
+        if not isinstance(child_steps, list):
+            return
+        csid = f"{sid}:trajectory:{tid}"
+        out.extend(_atif_steps(child_steps, csid, parent_sid, mdl))
+        sub = traj.get("subagent_trajectories") or []
+        if isinstance(sub, list):
+            for s in sub:
+                if isinstance(s, dict):
+                    walk(s, csid, depth + 1)
+
+    traj = obj.get("subagent_trajectories") or []
+    if isinstance(traj, list):
+        for t in traj:
+            if isinstance(t, dict):
+                walk(t, sid, 1)
     return out
 
 
@@ -322,6 +441,44 @@ def _import_claude(lines: list[tuple[int, dict]],
         role = obj.get("type") or (msg or {}).get("role")
         if not isinstance(msg, dict):
             continue
+        raw_usage = msg.get("usage")
+        if role == "assistant" and isinstance(raw_usage, dict):
+            def _u(key: str):
+                v = raw_usage.get(key)
+                if isinstance(v, bool) or not isinstance(v, int) \
+                        or v < 0:
+                    return None
+                return v
+            usage: dict = {}
+            inp = _u("input_tokens")
+            if inp is not None:
+                usage["input_tokens"] = inp + (
+                    _u("cache_read_input_tokens") or 0) + (
+                    _u("cache_creation_input_tokens") or 0)
+            out_tok = _u("output_tokens")
+            if out_tok is not None:
+                usage["output_tokens"] = out_tok
+            cached = _u("cache_read_input_tokens")
+            if cached is not None:
+                usage["cached_input_tokens"] = cached
+            created = _u("cache_creation_input_tokens")
+            if created is not None:
+                usage["cache_creation_input_tokens"] = created
+            if usage:
+                mid = msg.get("id")
+                out.append(Event(
+                    id=f"{sid}:{uuid_}:usage"
+                    if isinstance(uuid_, str) and uuid_
+                    else _det_id("claude", {**base, "u": raw_usage}),
+                    session_id=sid, agent="claude", kind="usage",
+                    timestamp=ts,
+                    data=redact({
+                        "usage": usage, "usage_scope": "delta",
+                        "usage_id": mid
+                        if isinstance(mid, str) and len(mid) <= 128
+                        else None,
+                    }),
+                ))
         content = msg.get("content")
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -380,9 +537,16 @@ def _codex_rollout_event(obj: dict, sid: str, i: int) -> list[Event]:
             )]
         if sub == "token_count":
             info = payload.get("info")
+            if not isinstance(info, dict):
+                return []
+            total = info.get("total_token_usage")
+            if isinstance(total, dict):
+                data = {"usage": total, "usage_scope": "cumulative"}
+            else:
+                data = {"usage": info, "usage_scope": "unclassified"}
             return [Event(
                 id=eid, session_id=sid, agent="codex", kind="usage",
-                timestamp=ts, data=redact({"usage": info or {}}),
+                timestamp=ts, data=redact(data),
             )]
         return []
     if ptype == "response_item":
@@ -455,6 +619,11 @@ def _import_codex(lines: list[tuple[int, dict]],
                   session_id: str | None) -> list[Event]:
     sid = session_id or ""
     for _, obj in lines:
+        if obj.get("type") == "session_meta":
+            p = obj.get("payload")
+            if isinstance(p, dict) and p.get("id"):
+                sid = session_id or str(p["id"])
+                break
         if obj.get("type") == "thread.started" and obj.get("thread_id"):
             sid = session_id or str(obj["thread_id"])
             break
@@ -465,6 +634,21 @@ def _import_codex(lines: list[tuple[int, dict]],
     out: list[Event] = []
     turn = 0
     for i, obj in lines:
+        if obj.get("type") == "session_meta":
+            p = obj.get("payload")
+            if isinstance(p, dict):
+                out.append(Event(
+                    id=f"{sid}:session_meta",
+                    session_id=sid, agent="codex",
+                    kind="session_start", timestamp=_ts(obj),
+                    data=redact({
+                        "native_id": p.get("id"),
+                        "cwd": p.get("cwd"),
+                        "source": p.get("source") or p.get(
+                            "thread_source"),
+                    }),
+                ))
+            continue
         if obj.get("type") == "turn.started":
             turn += 1
         if obj.get("type") in ("event_msg", "response_item"):

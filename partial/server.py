@@ -15,8 +15,9 @@ from urllib.parse import parse_qs, urlsplit
 from . import __version__
 from .accounts import Accounts, AccountsError, Principal
 from .handoff import format_handoff
+from .models import now_iso, sha256_hex
 from .privacy import redact
-from .store import Store
+from .store import RUN_KINDS, Store
 
 MAX_BODY = 16 * 1024 * 1024
 SESSION_TTL = 12 * 3600
@@ -89,6 +90,13 @@ class _Context:
         self.accounts = None if demo else Accounts(
             store.path.parent, store.path)
         self.login_hits: dict[str, list[float]] = {}
+        self.job_sems: dict[str, threading.Semaphore] = {}
+        self.cleaned_stores: set[str] = set()
+        self.active_runs: set[str] = set()
+        # Bounded history of run ids this process created, so stale-run
+        # recovery can tell "our worker is gone" from "a live foreign
+        # process owns this row" without a second persisted marker.
+        self.known_runs: set[str] = set()
         self.allowed_hosts: set[str] = set()
         self.allowed_origins: set[str] = set()
         self.secure_cookie = False
@@ -122,6 +130,74 @@ class _Context:
             hits.append(now)
             return True
 
+    def job_sem(self, ws_id: str) -> threading.Semaphore:
+        with self.lock:
+            if len(self.job_sems) >= 1024 \
+                    and ws_id not in self.job_sems:
+                raise ApiError(429, "too many workspaces")
+            return self.job_sems.setdefault(
+                ws_id, threading.Semaphore(4))
+
+    def track_run(self, run_id: str) -> None:
+        with self.lock:
+            if len(self.active_runs) >= 4096 \
+                    and run_id not in self.active_runs:
+                raise ApiError(429, "too many workflow runs")
+            self.active_runs.add(run_id)
+            if len(self.known_runs) < 65536:
+                self.known_runs.add(run_id)
+
+    def untrack_run(self, run_id: str) -> None:
+        with self.lock:
+            self.active_runs.discard(run_id)
+
+    def job_cleanup(self, store: Store) -> None:
+        key = str(store.path)
+        with self.lock:
+            if key in self.cleaned_stores:
+                return
+            self.cleaned_stores.add(key)
+        try:
+            self._recover_runs(store)
+        except Exception:
+            pass
+
+    def _recover_runs(self, store: Store) -> None:
+        # Safe local-process recovery.  The store's canonical
+        # owner-marker check interrupts a 'running' row only when its
+        # recorded owner pid is provably dead (or the row predates
+        # owner tracking); a row owned by a live foreign process is
+        # never touched.  Afterwards, rows this process started but
+        # no longer tracks are interrupted here: their worker is gone
+        # even though the process itself is alive.
+        try:
+            store.interrupt_running_runs()
+        except Exception:
+            pass
+        for run in store.list_runs(limit=10000):
+            if run.get("status") != "running":
+                continue
+            det = run.get("details")
+            if not isinstance(det, dict):
+                det = {}
+            rid = run.get("id")
+            with self.lock:
+                recover = rid in self.known_runs \
+                    and rid not in self.active_runs
+            if not recover:
+                continue
+            report = dict(run.get("report") or {})
+            report["error"] = (
+                "interrupted: the worker process exited before this"
+                " run finished")
+            try:
+                store.save_run(
+                    rid, run["kind"], run.get("repo_id"),
+                    "interrupted", run.get("source_ids") or [],
+                    report, det)
+            except Exception:
+                pass
+
 
 def _safe_event(e: dict) -> dict:
     return {
@@ -145,6 +221,26 @@ def _safe_checkpoint(c: dict, *, full: bool) -> dict:
         out["diff"] = c.get("diff")
         out["links"] = c.get("links") or []
     return out
+
+
+def _safe_run(run: dict) -> dict:
+    out = dict(run)
+    det = out.get("details")
+    if isinstance(det, dict):
+        out["details"] = {
+            k: v for k, v in det.items()
+            if k not in ("run_owner", "runner", "pid")}
+    return out
+
+
+def _require_external_ai(store: Store) -> None:
+    if store.memory_setting("external_ai_enabled") != "true":
+        raise ApiError(
+            403, "external AI disabled; an owner must enable it"
+                 " under Memory settings")
+    from .ai import OpenAIProvider
+    if not OpenAIProvider().configured:
+        raise ApiError(400, "AI provider is not configured")
 
 
 def _page(args: dict, default: int, max_limit: int) -> tuple[int, int]:
@@ -296,16 +392,19 @@ def _make_handler(ctx):
             if ctx.demo:
                 if write or admin or owner:
                     raise ApiError(403, "demo workspace is read-only")
+                ctx.job_cleanup(ctx.store)
                 return ctx.store, {
                     "id": "demo", "name": "Demo workspace",
                     "role": "owner"}
             ws_id = self.headers.get(WS_HEADER)
             try:
-                return ctx.accounts.workspace_store(
+                store, ws = ctx.accounts.workspace_store(
                     principal, ws_id, write=write, admin=admin,
                     owner=owner)
             except AccountsError as exc:
                 raise ApiError(exc.code, str(exc))
+            ctx.job_cleanup(store)
+            return store, ws
 
         def _guard_write(self, browser_origin, principal):
             if not browser_origin and principal.token_id is None:
@@ -423,6 +522,14 @@ def _make_handler(ctx):
                 self._resolve_ws(principal)
                 return self._json(200, _integrations())
             store, _ws = self._resolve_ws(principal)
+            if path.startswith("/api/memory/") \
+                    or path.startswith("/api/graph/") \
+                    or path == "/api/decisions" \
+                    or path == "/api/dispatch" \
+                    or path == "/api/projects" \
+                    or path.startswith("/api/workflows") \
+                    or path == "/api/experts":
+                return self._memory_get(store, path, qs)
             if path == "/api/overview":
                 s = store.stats()
                 return self._json(200, {
@@ -489,6 +596,54 @@ def _make_handler(ctx):
                         "created_at": repo["created_at"],
                     },
                     "branches": store.repo_branches(m)})
+            m = _match(path, "/api/sessions/", suffix="/usage")
+            if m:
+                if not _ID64_RE.fullmatch(m):
+                    raise ApiError(404, "session not found")
+                sess = store.get_session(m)
+                if sess is None:
+                    raise ApiError(404, "session not found")
+                from .brain_contract import usage_totals
+                return self._json(
+                    200, {"usage": usage_totals(sess["events"])})
+            m = _match(path, "/api/checkpoints/", suffix="/usage")
+            if m:
+                if not _ID32_RE.fullmatch(m):
+                    raise ApiError(404, "checkpoint not found")
+                cp = store.get_checkpoint(m)
+                if cp is None:
+                    raise ApiError(404, "checkpoint not found")
+                from .brain_contract import usage_totals
+                seen = set()
+                items = []
+                for link in cp["links"]:
+                    sid = link["session_id"]
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                    sess = store.get_session(sid)
+                    if sess is not None:
+                        items.append({"session": sid, **usage_totals(
+                            sess["events"])})
+                return self._json(200, {"sessions": items})
+            m = _match(path, "/api/sessions/", suffix="/native")
+            if m:
+                if not _ID64_RE.fullmatch(m) or \
+                        store.get_session_meta(m) is None:
+                    raise ApiError(404, "session not found")
+                row = store.get_native(m)
+                if row is None:
+                    return self._json(200, {"native": None})
+                return self._json(200, {"native": {
+                    "session_id": row["session_id"],
+                    "agent": row["agent"],
+                    "native_id": row["native_id"],
+                    "format": row["format"],
+                    "registered_at": row["registered_at"],
+                    "source": row["source"],
+                    "has_local_path": bool(row.get("local_path")),
+                    "has_archive": bool(row.get("archive")),
+                }})
             m = _match(path, "/api/sessions/", suffix="/handoff")
             if m:
                 if not _ID64_RE.fullmatch(m):
@@ -518,6 +673,13 @@ def _make_handler(ctx):
                     raise ApiError(404, "checkpoint not found")
                 return self._json(200, {
                     "items": store.list_reviews(m)})
+            m = _match(path, "/api/checkpoints/", suffix="/attribution")
+            if m:
+                if not _ID32_RE.fullmatch(m) or \
+                        store.get_checkpoint(m) is None:
+                    raise ApiError(404, "checkpoint not found")
+                return self._json(200, {
+                    "attribution": store.get_attribution(m)})
             m = _match(path, "/api/checkpoints/")
             if m:
                 if not _ID32_RE.fullmatch(m):
@@ -529,7 +691,8 @@ def _make_handler(ctx):
                             store.sessions_for_checkpoint(m)]
                 return self._json(200, {
                     "checkpoint": _safe_checkpoint(cp, full=True),
-                    "sessions": sessions})
+                    "sessions": sessions,
+                    "attribution": store.get_attribution(m)})
             raise ApiError(404, "not found")
 
         def _session_detail(self, store, sid, qs):
@@ -556,6 +719,330 @@ def _make_handler(ctx):
                 "checkpoints": store.checkpoints_for_session(
                     row["id"]),
                 "children": children})
+
+        def _memory_get(self, store, path, qs):
+            from .memory import Memory
+            mem = Memory(store)
+            if path == "/api/memory/status":
+                conn = store._connect()
+                try:
+                    docs = conn.execute(
+                        "SELECT COUNT(*) c FROM memory_documents"
+                    ).fetchone()["c"]
+                    idx = [dict(r) for r in conn.execute(
+                        "SELECT repo_id,commit_sha,indexed_at"
+                        " FROM repository_indexes").fetchall()]
+                finally:
+                    conn.close()
+                from .ai import OpenAIProvider
+                provider = OpenAIProvider()
+                return self._json(200, {
+                    "fts5": getattr(store, "fts_ok", False),
+                    "documents": docs,
+                    "indexed_repositories": idx,
+                    "provider_configured": provider.configured,
+                    "external_ai_enabled": store.memory_setting(
+                        "external_ai_enabled") == "true",
+                    "graph": mem.graph_capabilities(),
+                })
+            if path == "/api/memory/search":
+                raw_limit = _qs(qs, "limit")
+                try:
+                    limit = int(raw_limit) \
+                        if raw_limit is not None else 12
+                except (TypeError, ValueError):
+                    raise ApiError(400, "invalid limit")
+                if not 1 <= limit <= 100:
+                    raise ApiError(400, "limit must be 1..100")
+                rows = mem.search(
+                    _qs(qs, "q") or "", repo_id=_qs(qs, "repo"),
+                    kind=_qs(qs, "kind"), limit=limit)
+                return self._json(200, {"items": rows,
+                                        "mode": "lexical"})
+            if path == "/api/memory/context":
+                out = mem.context(_qs(qs, "q") or "",
+                                  repo_id=_qs(qs, "repo"))
+                return self._json(200, out)
+            m = _match(path, "/api/memory/documents/")
+            if m:
+                doc = mem.document(m)
+                if doc is None:
+                    raise ApiError(404, "document not found")
+                return self._json(200, {"document": doc})
+            if path == "/api/decisions":
+                return self._json(200, {
+                    "items": mem.decisions(_qs(qs, "repo"))})
+            if path == "/api/graph/search":
+                return self._json(200, {"items": mem.graph_search(
+                    _qs(qs, "q") or "", repo_id=_qs(qs, "repo"))})
+            if path == "/api/graph/neighbors":
+                sid = _qs(qs, "id")
+                if not sid:
+                    raise ApiError(400, "id required")
+                return self._json(200, mem.graph_neighbors(
+                    sid, repo_id=_qs(qs, "repo")))
+            if path == "/api/graph/impact":
+                sid = _qs(qs, "id")
+                if not sid:
+                    raise ApiError(400, "id required")
+                return self._json(200, mem.graph_impact(
+                    sid, repo_id=_qs(qs, "repo")))
+            if path == "/api/dispatch":
+                return self._json(200, mem.dispatch(
+                    repo_id=_qs(qs, "repo"),
+                    branch=_qs(qs, "branch"),
+                    since=_qs(qs, "since"), until=_qs(qs, "until")))
+            if path == "/api/experts":
+                repo = _qs(qs, "repo")
+                scope = _qs(qs, "scope")
+                if not repo or not scope:
+                    raise ApiError(400, "repo and scope required")
+                return self._json(200, {"items": mem.experts(
+                    scope, repo_id=repo)})
+            if path == "/api/workflows":
+                return self._json(200, {"items": [_safe_run(r) for r in
+                    store.list_runs(repo_id=_qs(qs, "repo"))]})
+            m = _match(path, "/api/workflows/")
+            if m:
+                run = store.get_run(m)
+                if run is None:
+                    raise ApiError(404, "workflow run not found")
+                return self._json(200, {"run": _safe_run(run)})
+            if path == "/api/projects":
+                return self._json(200, {"items": store.list_projects()})
+            raise ApiError(404, "not found")
+
+        def _memory_write(self, store, ws, principal, path, body):
+            from .memory import Memory
+            from .workflows import run_workflow
+            mem = Memory(store)
+            if path == "/api/memory/index":
+                obj = _obj(self._read_json(body))
+                repo_id = obj.get("repo_id")
+                semantic = obj.get("semantic", False)
+                if type(semantic) is not bool:
+                    raise ApiError(
+                        400, "semantic must be a boolean")
+                if repo_id is not None:
+                    if not _ID64_RE.fullmatch(str(repo_id)) \
+                            or store.get_repo(repo_id) is None:
+                        raise ApiError(404, "repository not found")
+                if semantic:
+                    _require_external_ai(store)
+                    out = mem.index(
+                        {"id": repo_id, "root": None}
+                        if repo_id is not None else None,
+                        semantic=True)
+                else:
+                    out = mem.index(
+                        {"id": repo_id, "root": None}
+                        if repo_id is not None else None)
+                return self._json(200, out)
+            if path == "/api/memory/settings":
+                obj = _obj(self._read_json(body))
+                enabled = obj.get("external_ai_enabled")
+                if not isinstance(enabled, bool):
+                    raise ApiError(
+                        400, "external_ai_enabled must be a boolean")
+                if enabled:
+                    from .ai import OpenAIProvider
+                    if not OpenAIProvider().configured:
+                        raise ApiError(
+                            400, "AI provider is not configured; set"
+                                 " PARTIAL_OPENAI_API_KEY on the"
+                                 " server first")
+                store.set_memory_setting(
+                    "external_ai_enabled", "true" if enabled else
+                    "false")
+                return self._json(200, {
+                    "external_ai_enabled": enabled})
+            if path == "/api/memory/search":
+                obj = _obj(self._read_json(body))
+                query = obj.get("query")
+                if not isinstance(query, str) or not query.strip() \
+                        or len(query) > 500:
+                    raise ApiError(400, "query must be 1..500 chars")
+                repo_id = obj.get("repo_id")
+                if repo_id is not None and (
+                        not isinstance(repo_id, str)
+                        or not _ID64_RE.fullmatch(repo_id)):
+                    raise ApiError(400, "invalid repo_id")
+                if repo_id is not None \
+                        and store.get_repo(repo_id) is None:
+                    raise ApiError(404, "repository not found")
+                kind = obj.get("kind")
+                if kind is not None and kind not in (
+                        "code", "session", "checkpoint", "decision"):
+                    raise ApiError(400, "invalid kind")
+                limit = obj.get("limit", 12)
+                if type(limit) is not int or not 1 <= limit <= 100:
+                    raise ApiError(400, "limit must be 1..100")
+                semantic = obj.get("semantic", False)
+                if type(semantic) is not bool:
+                    raise ApiError(400, "semantic must be a boolean")
+                if semantic:
+                    _require_external_ai(store)
+                try:
+                    rows = mem.search(
+                        query, repo_id=repo_id, kind=kind,
+                        semantic=semantic, limit=limit)
+                except ValueError as exc:
+                    raise ApiError(400, str(exc))
+                return self._json(200, {
+                    "items": rows,
+                    "mode": "hybrid" if semantic else "lexical"})
+            if path == "/api/decisions":
+                obj = _obj(self._read_json(body))
+                repo_id = obj.get("repo_id")
+                if not isinstance(repo_id, str) \
+                        or not _ID64_RE.fullmatch(repo_id) \
+                        or store.get_repo(repo_id) is None:
+                    raise ApiError(404, "repository not found")
+                sources = obj.get("source_ids") or []
+                if not isinstance(sources, list):
+                    raise ApiError(400, "source_ids must be a list")
+                supersedes = obj.get("supersedes")
+                if supersedes is not None \
+                        and not isinstance(supersedes, str):
+                    raise ApiError(400, "supersedes must be a string")
+                d = mem.add_decision(
+                    repo_id, obj.get("title"), obj.get("body"),
+                    sources, author=principal.name,
+                    supersedes=obj.get("supersedes"))
+                return self._json(201, {"item": d})
+            if path == "/api/projects":
+                obj = _obj(self._read_json(body))
+                p = store.create_project(obj.get("name"))
+                return self._json(201, {"item": p})
+            m = _match(path, "/api/projects/", suffix="/attach")
+            if m:
+                obj = _obj(self._read_json(body))
+                repo_id = obj.get("repo_id")
+                if not isinstance(repo_id, str) \
+                        or not _ID64_RE.fullmatch(repo_id):
+                    raise ApiError(400, "repo_id required")
+                try:
+                    p = store.attach_project_repo(m, repo_id)
+                except KeyError:
+                    raise ApiError(404, "project or repository"
+                                    " not found")
+                return self._json(200, {"item": p})
+            if path == "/api/workflows":
+                obj = _obj(self._read_json(body))
+                kind = obj.get("kind")
+                if kind not in RUN_KINDS:
+                    raise ApiError(400, "invalid workflow kind")
+                repo_id = obj.get("repo_id")
+                if repo_id is not None and (
+                        not isinstance(repo_id, str)
+                        or not _ID64_RE.fullmatch(repo_id)
+                        or store.get_repo(repo_id) is None):
+                    raise ApiError(404, "repository not found")
+                query = obj.get("query")
+                if query is not None and (
+                        not isinstance(query, str)
+                        or len(query) > 500):
+                    raise ApiError(
+                        400, "query must be a string <=500 chars")
+                run = obj.get("run", False)
+                if type(run) is not bool:
+                    raise ApiError(400, "run must be a boolean")
+                semantic = obj.get("semantic", False)
+                if type(semantic) is not bool:
+                    raise ApiError(400, "semantic must be a boolean")
+                since = obj.get("since")
+                until = obj.get("until")
+                branch = obj.get("branch")
+                for name, val in (("since", since), ("until", until),
+                                  ("branch", branch)):
+                    if val is not None and (
+                            not isinstance(val, str)
+                            or len(val) > 200):
+                        raise ApiError(
+                            400, f"{name} must be a string <=200"
+                                 " chars")
+                agents = obj.get("agents")
+                if agents:
+                    raise ApiError(
+                        400, "native agents cannot be run from the"
+                             " API; use the CLI")
+                if run:
+                    _require_external_ai(store)
+                    sem = ctx.job_sem(str(ws.get("id") or "demo"))
+                    if not sem.acquire(blocking=False):
+                        raise ApiError(
+                            429, "too many running workflows")
+                    rid = sha256_hex(
+                        "run/v1\0" + str(kind) + "\0"
+                        + str(query or "") + "\0" + now_iso())
+                    try:
+                        ctx.track_run(rid)
+                        # save_run stamps the private run_owner marker
+                        # itself; no caller-supplied ownership keys.
+                        store.save_run(rid, kind, repo_id,
+                                       "running", [], {}, {})
+                    except Exception:
+                        ctx.untrack_run(rid)
+                        sem.release()
+                        raise
+
+                    def _job():
+                        try:
+                            run_workflow(
+                                store, kind, repo_id=repo_id,
+                                query=query or "", run=True,
+                                run_id=rid, since=since,
+                                until=until, branch=branch)
+                        except BaseException as exc:
+                            try:
+                                store.save_run(
+                                    rid, kind, repo_id, "error", [],
+                                    {"error": str(redact(
+                                        str(exc)))[:500]}, {})
+                            except Exception:
+                                pass
+                        finally:
+                            try:
+                                cur = store.get_run(rid)
+                                if cur is not None and cur.get(
+                                        "status") == "running":
+                                    rep = dict(
+                                        cur.get("report") or {})
+                                    rep["error"] = (
+                                        "worker exited without a"
+                                        " result")
+                                    store.save_run(
+                                        rid, kind, repo_id, "error",
+                                        cur.get("source_ids") or [],
+                                        rep,
+                                        cur.get("details") or {})
+                            except Exception:
+                                pass
+                            ctx.untrack_run(rid)
+                            sem.release()
+                    try:
+                        threading.Thread(
+                            target=_job, daemon=True).start()
+                    except Exception:
+                        ctx.untrack_run(rid)
+                        sem.release()
+                        try:
+                            store.save_run(
+                                rid, kind, repo_id, "error", [],
+                                {"error": "worker could not be"
+                                          " started"}, {})
+                        except Exception:
+                            pass
+                        raise ApiError(
+                            500, "could not start workflow run")
+                    return self._json(202, {"id": rid,
+                                            "status": "running"})
+                out = run_workflow(
+                    store, kind, repo_id=repo_id,
+                    query=query or "", run=False,
+                    since=since, until=until, branch=branch)
+                return self._json(200, out)
+            raise ApiError(404, "not found")
 
         def _principal_workspaces(self, principal: Principal):
             if principal.token_id is not None:
@@ -637,6 +1124,18 @@ def _make_handler(ctx):
                 obj = _obj(self._read_json(body))
                 result = store.import_bundle(obj)
                 return self._json(200, {"ok": True, "counts": result})
+            if method == "POST" and path == "/api/memory/settings":
+                store, ws = self._resolve_ws(principal, owner=True)
+                return self._memory_write(
+                    store, ws, principal, path, body)
+            if method == "POST" and (
+                    path.startswith("/api/memory/")
+                    or path in ("/api/decisions", "/api/workflows",
+                                "/api/projects")
+                    or path.startswith("/api/projects/")):
+                store, ws = self._resolve_ws(principal, write=True)
+                return self._memory_write(
+                    store, ws, principal, path, body)
             if method == "POST" and path == "/api/account/password":
                 if principal.token_id is not None:
                     raise ApiError(403, "password change requires"
@@ -725,8 +1224,8 @@ def _make_handler(ctx):
             try:
                 raw, principal = ctx.accounts.login(
                     obj.get("email"), obj.get("password"))
-            except AccountsError:
-                raise ApiError(401, "invalid credentials")
+            except AccountsError as exc:
+                raise ApiError(exc.code, str(exc))
             self._json(200, {"ok": True}, headers={
                 "Set-Cookie": self._cookie(raw, SESSION_TTL)})
 

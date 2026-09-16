@@ -38,6 +38,10 @@ class HttpError extends Error {
   }
 }
 
+function isAbort(err) {
+  return !!err && err.name === "AbortError";
+}
+
 function demoMode() { return !!(me && me.demo); }
 
 function wsHeaders(extra, wsId) {
@@ -65,10 +69,11 @@ async function api(path, opts = {}) {
   return data;
 }
 
-async function fetchBlob(path, filename, wsId) {
+async function fetchBlob(path, filename, wsId, signal) {
   try {
     const res = await fetch(path, {
-      credentials: "same-origin", headers: wsHeaders(null, wsId) });
+      credentials: "same-origin", signal,
+      headers: wsHeaders(null, wsId) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
@@ -80,6 +85,7 @@ async function fetchBlob(path, filename, wsId) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   } catch (err) {
+    if (isAbort(err)) return;
     showErr(err.message || "Download failed");
   }
 }
@@ -100,6 +106,7 @@ function showLogin(mode) {
   currentWs = null;
   routeVersion++;
   if (routeCtl) routeCtl.abort();
+  closeDocOverlay();
   view.textContent = "";
   setSidebarOpen(false);
   document.getElementById("sys-status").textContent = "";
@@ -251,6 +258,10 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
     e.preventDefault();
     document.getElementById("gsearch-q").focus();
+  }
+  if (e.key === "Escape" && docOverlay) {
+    closeDocOverlay();
+    return;
   }
   if (e.key === "Escape" && sidebar.classList.contains("open")) {
     setSidebarOpen(false);
@@ -515,6 +526,100 @@ async function vRepos(root, signal) {
       })));
   }
   root.appendChild(p);
+
+  const pj = await api("/api/projects", { signal, ws: wsId });
+  const pp = el("div", "panel");
+  pp.appendChild(el("h2", null, "Project groups"));
+  pp.appendChild(el("p", "hint small",
+    "Project groups organize repositories inside this workspace;" +
+    " they do not change access control — the workspace is the" +
+    " trust boundary."));
+  if (!pj.items.length)
+    pp.appendChild(el("div", "empty", "No project groups yet."));
+  else
+    for (const proj of pj.items) {
+      const card = el("div", "cap");
+      card.appendChild(el("strong", null, `${proj.name} — `));
+      const rids = proj.repos || [];
+      if (!rids.length)
+        card.appendChild(document.createTextNode("no repositories"));
+      rids.forEach((rid, i) => {
+        if (i) card.appendChild(document.createTextNode(", "));
+        const r = d.items.find((x) => x.id === rid);
+        if (r) {
+          const a = el("a", null, r.name);
+          a.href = `#/repos/${r.id}`;
+          card.appendChild(a);
+        } else {
+          card.appendChild(el("span", "mono", rid.slice(0, 10)));
+        }
+      });
+      pp.appendChild(card);
+    }
+  if (canWrite()) {
+    const pjStatus = el("div");
+    pjStatus.setAttribute("aria-live", "polite");
+    const cForm = el("div", "filters");
+    const nameIn = el("input");
+    nameIn.placeholder = "New project name";
+    nameIn.setAttribute("aria-label", "New project name");
+    const cBtn = el("button", null, "Create project");
+    cBtn.addEventListener("click", async () => {
+      pjStatus.textContent = "";
+      cBtn.disabled = true;
+      try {
+        await api("/api/projects", {
+          method: "POST", ws: wsId, signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: nameIn.value }) });
+        route();
+      } catch (err) {
+        if (isAbort(err)) return;
+        pjStatus.className = "notice-err";
+        pjStatus.textContent = err.message;
+        cBtn.disabled = false;
+      }
+    });
+    cForm.append(nameIn, cBtn);
+    pp.appendChild(cForm);
+    if (pj.items.length && d.items.length) {
+      const aForm = el("div", "filters");
+      const pSel = el("select");
+      pSel.setAttribute("aria-label", "Project");
+      for (const proj of pj.items)
+        pSel.appendChild(new Option(proj.name, proj.id));
+      const rSel = el("select");
+      rSel.setAttribute("aria-label", "Repository to attach");
+      for (const r of d.items)
+        rSel.appendChild(new Option(r.name, r.id));
+      const aBtn = el("button", null, "Attach repository");
+      aBtn.addEventListener("click", async () => {
+        pjStatus.textContent = "";
+        aBtn.disabled = true;
+        try {
+          await api(`/api/projects/${pSel.value}/attach`, {
+            method: "POST", ws: wsId, signal,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ repo_id: rSel.value }) });
+          route();
+        } catch (err) {
+          if (isAbort(err)) return;
+          pjStatus.className = "notice-err";
+          pjStatus.textContent = err.message;
+          aBtn.disabled = false;
+        }
+      });
+      aForm.append(pSel, rSel, aBtn);
+      pp.appendChild(aForm);
+    }
+    pp.appendChild(pjStatus);
+  } else {
+    pp.appendChild(el("p", "hint small",
+      demoMode()
+        ? "Demo workspace is read-only."
+        : "Managing project groups requires the member role."));
+  }
+  root.appendChild(pp);
 }
 
 async function vRepoDetail(root, id, params, signal) {
@@ -737,21 +842,21 @@ async function vSessionDetail(root, id, params, signal) {
   copyH.addEventListener("click", async () => {
     try {
       const res = await fetch(`/api/sessions/${id}/handoff`, {
-        credentials: "same-origin",
+        credentials: "same-origin", signal,
         headers: wsHeaders(null, wsId) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       copyH.textContent =
         (await copyText(text)) ? "Copied" : "Copy failed";
-    } catch (_) {
-      copyH.textContent = "Copy failed";
+    } catch (err) {
+      if (!isAbort(err)) copyH.textContent = "Copy failed";
     }
     setTimeout(() => { copyH.textContent = "Copy handoff"; }, 1500);
   });
   const dlH = el("button", "button", "Download handoff");
   dlH.addEventListener("click", () =>
     fetchBlob(`/api/sessions/${id}/handoff`, "partial-handoff.md",
-      wsId));
+      wsId, signal));
   acts.append(copyH, dlH);
   head.appendChild(acts);
   root.appendChild(head);
@@ -831,6 +936,56 @@ async function vSessionDetail(root, id, params, signal) {
       side.appendChild(a);
     }
   }
+  let nat = null;
+  try {
+    nat = await api(`/api/sessions/${id}/native`,
+      { signal, ws: wsId });
+  } catch (e) {
+    if (!(e instanceof HttpError && e.status === 404)) throw e;
+  }
+  if (nat && nat.native) {
+    side.appendChild(el("h3", null, "Native resume"));
+    const nr = el("div", "hint",
+      `${nat.native.agent} · ${nat.native.format}` +
+      ` · ${nat.native.native_id}`);
+    side.appendChild(nr);
+    const cmd = `partial resume ${s.id}`;
+    const row = el("div", "filters");
+    row.appendChild(el("span", "mono", cmd));
+    row.appendChild(copyBtn(cmd));
+    side.appendChild(row);
+    side.appendChild(el("div", "hint",
+      (nat.native.has_local_path ? "Native state registered"
+        : "requires local native state") +
+      (nat.native.has_archive ? " · archive stored" : "")));
+  }
+  let usage = null;
+  try {
+    usage = await api(`/api/sessions/${id}/usage`,
+      { signal, ws: wsId });
+  } catch (e) {
+    if (!(e instanceof HttpError && e.status === 404)) throw e;
+  }
+  if (usage && usage.usage) {
+    const u = usage.usage;
+    side.appendChild(el("h3", null, "Token usage"));
+    const rows = [
+      ["input", u.input_tokens],
+      ["output", u.output_tokens],
+      ["cached input", u.cached_input_tokens],
+      ["cache creation", u.cache_creation_input_tokens],
+    ];
+    const t = el("div", "cap");
+    t.textContent = rows
+      .filter(([, v]) => v != null)
+      .map(([k, v]) => `${k} ${v}`).join(" · ") || "no reported usage";
+    side.appendChild(t);
+    side.appendChild(el("div", "cap",
+      `basis ${u.basis} · events ${u.events_used}` +
+      (u.unclassified_events
+        ? ` · ${u.unclassified_events} unclassified` : "") +
+      (u.complete ? " · complete" : " · incomplete")));
+  }
   const note = el("p", null,
     "Handoff exports the recorded context (prompts, responses, tool" +
     " activity) as Markdown. It does not restore native agent state.");
@@ -903,7 +1058,101 @@ async function vCheckpoints(root, params, signal) {
   root.appendChild(p);
 }
 
-function renderDiff(diff, files) {
+function _attrLines(att) {
+  const m = {};
+  for (const f of (att && att.files) || []) {
+    const e = { "new": {}, "old": {} };
+    for (const l of f.lines || []) {
+      if (l && (l.side === "new" || l.side === "old")
+          && typeof l.line === "number") {
+        e[l.side][l.line] = l;
+      }
+    }
+    m[f.path] = e;
+  }
+  return m;
+}
+
+function _attrBadge(ent) {
+  const kind = ent && ent.kind ? ent.kind : "unknown";
+  const cls = kind === "agent" ? "attr-ai"
+    : kind === "human" ? "attr-hu" : "attr-unk";
+  const label = kind === "agent" ? "AI" : kind === "human" ? "HU" : "?";
+  const b = el("span", `attr-badge ${cls}`, label);
+  const parts = [kind === "human" ? "human-side (inferred)" : kind];
+  if (ent && ent.evidence) parts.push(ent.evidence);
+  if (ent && ent.session_id) parts.push(`session ${ent.session_id}`);
+  b.title = `AI attribution estimate: ${parts.join(" · ")}`;
+  return b;
+}
+
+function renderAttribution(att) {
+  const card = el("div", "panel attr-card");
+  card.appendChild(el("h3", null, "AI attribution estimate"));
+  if (!att || !att.summary) {
+    card.appendChild(el("div", "hint",
+      "No attribution captured for this checkpoint."));
+    return card;
+  }
+  const s = att.summary;
+  const counts = el("div", "attr-counts");
+  counts.textContent =
+    `agent +${s.agent_added}/−${s.agent_removed}` +
+    ` · human-side (inferred) +${s.human_added}/−${s.human_removed}` +
+    ` · unknown +${s.unknown_added}/−${s.unknown_removed}` +
+    ` · changed ${s.total_changed}`;
+  card.appendChild(counts);
+  const cov = el("div", "hint");
+  if (s.total_changed > 0 && s.coverage_percentage != null) {
+    cov.textContent =
+      `agent share ${s.agent_percentage}% ·` +
+      ` coverage ${s.coverage_percentage}% of changed lines`;
+  } else {
+    cov.textContent = "Not available — no changed lines measured.";
+  }
+  card.appendChild(cov);
+  const src = att.capture_source === "imported-claim"
+    ? "imported claim (unverified)" : "local observation";
+  card.appendChild(el("div", "hint", `source: ${src}`));
+  if ((att.excluded || []).length) {
+    card.appendChild(el("div", "hint",
+      `${att.excluded.length} file(s) excluded from measurement` +
+      ` (${att.excluded.map((x) => x.reason).join(", ")});` +
+      " percentages cover measured files only."));
+  }
+  for (const lim of att.limitations || []) {
+    card.appendChild(el("div", "hint", String(lim)));
+  }
+  const rows = [];
+  for (const f of att.files || []) {
+    for (const l of f.lines || []) {
+      rows.push([
+        `${f.path}:${l.side === "new" ? "+" : "-"}${l.line}`,
+        _attrBadge(l),
+        l.evidence || "—",
+        l.session_id ? l.session_id.slice(0, 12) : "—",
+      ]);
+    }
+  }
+  if (rows.length) {
+    const det = el("details");
+    det.appendChild(el("summary", "hint",
+      `All attributed lines (${rows.length})`));
+    det.appendChild(table(
+      ["Line", "Estimate", "Evidence", "Session"],
+      rows.slice(0, 2000)));
+    if (rows.length > 2000) {
+      det.appendChild(el("div", "hint",
+        `Showing 2000 of ${rows.length} attributed lines` +
+        " (truncated)."));
+    }
+    card.appendChild(det);
+  }
+  return card;
+}
+
+function renderDiff(diff, files, att) {
+  const amap = _attrLines(att);
   const wrap = el("div");
   const sections = [];
   let cur = null;
@@ -929,19 +1178,38 @@ function renderDiff(diff, files) {
     det.open = true;
     det.appendChild(el("summary", "fname", fname || "patch"));
     const pre = el("pre", "diff");
+    const fmap = fname ? amap[fname] : null;
+    let oldNo = 0;
+    let newNo = 0;
     for (const line of sec.lines) {
+      const hm = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hm) {
+        oldNo = parseInt(hm[1], 10);
+        newNo = parseInt(hm[2], 10);
+      }
       const span = el("span");
+      let badge = null;
       if (line.startsWith("+") && !line.startsWith("+++")) {
         span.className = "d-add";
+        if (fmap) badge = _attrBadge(fmap.new[newNo]);
+        newNo += 1;
       } else if (line.startsWith("-") && !line.startsWith("---")) {
         span.className = "d-del";
+        if (fmap) badge = _attrBadge(fmap.old[oldNo]);
+        oldNo += 1;
       } else if (line.startsWith("@@")) {
         span.className = "d-hunk";
+      } else if (line.startsWith("\\")) {
+        span.className = "d-head";
       } else if (line.startsWith("diff ") || line.startsWith("index ") ||
                  line.startsWith("---") || line.startsWith("+++")) {
         span.className = "d-head";
+      } else if (line.startsWith(" ")) {
+        oldNo += 1;
+        newNo += 1;
       }
       span.textContent = line + "\n";
+      if (badge) pre.appendChild(badge);
       pre.appendChild(span);
     }
     det.appendChild(pre);
@@ -987,6 +1255,7 @@ async function vCheckpointDetail(root, id, params, signal) {
     ` captured ${fmtDate(c.created_at)}`;
   head.appendChild(sub);
   root.appendChild(head);
+  root.appendChild(renderAttribution(d.attribution));
 
   const tab = params.get("tab") || "changes";
   const tabs = el("div", "tabs");
@@ -1020,7 +1289,7 @@ async function vCheckpointDetail(root, id, params, signal) {
     root.appendChild(p);
   } else {
     const p = el("div", "panel");
-    p.appendChild(renderDiff(c.diff, c.files));
+    p.appendChild(renderDiff(c.diff, c.files, d.attribution));
     root.appendChild(p);
   }
 
@@ -1060,7 +1329,7 @@ async function vCheckpointDetail(root, id, params, signal) {
       try {
         const res = await fetch(`/api/checkpoints/${id}/reviews`, {
           method: "POST",
-          credentials: "same-origin",
+          credentials: "same-origin", signal,
           headers: wsHeaders(
             { "Content-Type": "application/json" }, wsId),
           body: JSON.stringify({ body: bodyIn.value }),
@@ -1083,6 +1352,7 @@ async function vCheckpointDetail(root, id, params, signal) {
         rv.appendChild(el("div", "what", r.body));
         list.appendChild(rv);
       } catch (err) {
+        if (isAbort(err)) return;
         status.className = "notice-err";
         status.textContent = err.message || "Save failed";
       } finally {
@@ -1268,7 +1538,7 @@ async function vIntegrations(root, signal) {
     try {
       const res = await fetch("/api/bundles", {
         method: "POST",
-        credentials: "same-origin",
+        credentials: "same-origin", signal,
         headers: wsHeaders(
           { "Content-Type": "application/json" }, wsId),
         body: text,
@@ -1282,6 +1552,7 @@ async function vIntegrations(root, signal) {
       file.value = "";
       setTimeout(() => route(), 400);
     } catch (err) {
+      if (isAbort(err)) return;
       upStatus.className = "notice-err";
       upStatus.textContent = err.message || "Upload failed";
     }
@@ -1300,7 +1571,7 @@ async function vIntegrations(root, signal) {
   const exp = el("div", "filters");
   const expB = el("button", "button", "Download export bundle");
   expB.addEventListener("click", () =>
-    fetchBlob("/api/export", "partial-export.json", wsId));
+    fetchBlob("/api/export", "partial-export.json", wsId, signal));
   exp.appendChild(expB);
   tools.appendChild(exp);
   root.appendChild(tools);
@@ -1334,7 +1605,7 @@ async function vSettings(root, signal) {
       nwBtn.disabled = true;
       try {
         const res = await fetch("/api/workspaces", {
-          method: "POST", credentials: "same-origin",
+          method: "POST", credentials: "same-origin", signal,
           headers: wsHeaders(
             { "Content-Type": "application/json" }, wsId),
           body: JSON.stringify({ name: nwName.value.trim() }),
@@ -1344,13 +1615,14 @@ async function vSettings(root, signal) {
           throw new Error((data && data.error) || `HTTP ${res.status}`);
         }
         me = await api("/api/me", {
-          headers: wsHeaders(null, wsId) });
+          headers: wsHeaders(null, wsId), signal });
         pickWorkspace();
         renderWsSelect();
         nwStatus.className = "notice-ok";
         nwStatus.textContent = "Workspace created.";
         nwName.value = "";
       } catch (err) {
+        if (isAbort(err)) return;
         nwStatus.className = "notice-err";
         nwStatus.textContent = err.message || "Create failed";
       } finally {
@@ -1382,7 +1654,7 @@ async function vSettings(root, signal) {
       ajTok.value = "";
       try {
         const res = await fetch("/api/invites/accept", {
-          method: "POST", credentials: "same-origin",
+          method: "POST", credentials: "same-origin", signal,
           headers: wsHeaders(
             { "Content-Type": "application/json" }, wsId),
           body: JSON.stringify({ token: tok, email: me.user.email }),
@@ -1392,13 +1664,14 @@ async function vSettings(root, signal) {
           throw new Error((data && data.error) || `HTTP ${res.status}`);
         }
         me = await api("/api/me", {
-          headers: wsHeaders(null, wsId) });
+          headers: wsHeaders(null, wsId), signal });
         pickWorkspace();
         renderWsSelect();
         ajStatus.className = "notice-ok";
         ajStatus.textContent =
           "Invitation accepted — select the workspace above.";
       } catch (err) {
+        if (isAbort(err)) return;
         ajStatus.className = "notice-err";
         ajStatus.textContent = err.message || "Accept failed";
       } finally {
@@ -1432,7 +1705,7 @@ async function vSettings(root, signal) {
           try {
             const res = await fetch(
               `/api/workspaces/${wsId}/members/${m.user_id}`, {
-                method: "PATCH", credentials: "same-origin",
+                method: "PATCH", credentials: "same-origin", signal,
                 headers: wsHeaders(
                   { "Content-Type": "application/json" }, wsId),
                 body: JSON.stringify({ role: sel.value }),
@@ -1443,6 +1716,7 @@ async function vSettings(root, signal) {
             }
             route();
           } catch (err) {
+            if (isAbort(err)) return;
             sel.disabled = false;
             showErr(err.message);
           }
@@ -1455,7 +1729,7 @@ async function vSettings(root, signal) {
           try {
             const res = await fetch(
               `/api/workspaces/${wsId}/members/${m.user_id}`, {
-                method: "DELETE", credentials: "same-origin",
+                method: "DELETE", credentials: "same-origin", signal,
                 headers: wsHeaders(
                   { "Content-Type": "application/json" }, wsId),
                 body: "{}",
@@ -1466,6 +1740,7 @@ async function vSettings(root, signal) {
             }
             route();
           } catch (err) {
+            if (isAbort(err)) return;
             rm.disabled = false;
             showErr(err.message);
           }
@@ -1504,7 +1779,7 @@ async function vSettings(root, signal) {
         try {
           const res = await fetch(
             `/api/workspaces/${wsId}/invites`, {
-              method: "POST", credentials: "same-origin",
+              method: "POST", credentials: "same-origin", signal,
               headers: wsHeaders(
                 { "Content-Type": "application/json" }, wsId),
               body: JSON.stringify({
@@ -1523,6 +1798,7 @@ async function vSettings(root, signal) {
           iTokenBox.appendChild(tb);
           iEmail.value = "";
         } catch (err) {
+          if (isAbort(err)) return;
           iStatus.className = "notice-err";
           iStatus.textContent = err.message || "Invite failed";
         } finally {
@@ -1560,7 +1836,7 @@ async function vSettings(root, signal) {
       try {
         const res = await fetch(
           `/api/workspaces/${wsId}/tokens`, {
-            method: "POST", credentials: "same-origin",
+            method: "POST", credentials: "same-origin", signal,
             headers: wsHeaders(
               { "Content-Type": "application/json" }, wsId),
             body: JSON.stringify({
@@ -1580,6 +1856,7 @@ async function vSettings(root, signal) {
         tBox.appendChild(tb);
         tName.value = "";
       } catch (err) {
+        if (isAbort(err)) return;
         tStatus.className = "notice-err";
         tStatus.textContent = err.message || "Token create failed";
       } finally {
@@ -1606,7 +1883,7 @@ async function vSettings(root, signal) {
               rb.disabled = true;
               try {
                 const res = await fetch(`/api/tokens/${t.id}`, {
-                  method: "DELETE", credentials: "same-origin",
+                  method: "DELETE", credentials: "same-origin", signal,
                   headers: wsHeaders(
                     { "Content-Type": "application/json" }, wsId),
                   body: "{}",
@@ -1618,6 +1895,7 @@ async function vSettings(root, signal) {
                 }
                 route();
               } catch (err) {
+                if (isAbort(err)) return;
                 rb.disabled = false;
                 showErr(err.message);
               }
@@ -1672,7 +1950,7 @@ async function vSettings(root, signal) {
       pBtn.disabled = true;
       try {
         const res = await fetch("/api/account/password", {
-          method: "POST", credentials: "same-origin",
+          method: "POST", credentials: "same-origin", signal,
           headers: wsHeaders(
             { "Content-Type": "application/json" }, wsId),
           body: JSON.stringify({
@@ -1684,6 +1962,7 @@ async function vSettings(root, signal) {
         }
         showLogin("signin");
       } catch (err) {
+        if (isAbort(err)) return;
         pStatus.className = "notice-err";
         pStatus.textContent = err.message || "Password change failed";
       } finally {
@@ -1696,6 +1975,882 @@ async function vSettings(root, signal) {
   }
 }
 
+function canWrite() {
+  return !demoMode() && currentWs
+    && ROLE_RANK[currentWs.role] >= ROLE_RANK.member;
+}
+
+function canOwner() {
+  return !demoMode() && currentWs && currentWs.role === "owner";
+}
+
+function docLoc(d) {
+  if (d.path) return `${d.path}:${d.line_start || 1}-${d.line_end || ""}`;
+  if (d.commit_sha) return `commit ${String(d.commit_sha).slice(0, 10)}`;
+  return d.source_id ? `source ${String(d.source_id).slice(0, 24)}` : "";
+}
+
+let docOverlay = null;
+let docOverlayFocus = null;
+
+function closeDocOverlay() {
+  if (docOverlay) {
+    docOverlay.remove();
+    docOverlay = null;
+  }
+  if (docOverlayFocus) {
+    try { docOverlayFocus.focus(); } catch (_) { /* noop */ }
+    docOverlayFocus = null;
+  }
+}
+
+async function openDoc(id, wsId) {
+  const gen = routeVersion;
+  const signal = routeCtl ? routeCtl.signal : undefined;
+  try {
+    const d = await api(
+      `/api/memory/documents/${encodeURIComponent(id)}`,
+      { ws: wsId, signal });
+    if (gen !== routeVersion || (signal && signal.aborted)) return;
+    const doc = d.document;
+    const panel = el("div", "panel");
+    panel.appendChild(el("h3", null, doc.title || doc.id));
+    panel.appendChild(el("div", "cap",
+      `${doc.kind} · ${docLoc(doc)} · ${doc.id.slice(0, 16)}`));
+    const links = el("div", "cap");
+    if (doc.kind === "session" && doc.source_id) {
+      const a = el("a", null, "open session");
+      a.href = `#/sessions/${doc.source_id.split(":")[0]}`;
+      links.appendChild(a);
+    }
+    if (doc.kind === "checkpoint" && doc.source_id) {
+      const a = el("a", null, "open checkpoint");
+      a.href = `#/checkpoints/${doc.source_id}`;
+      links.appendChild(a);
+    }
+    if (links.childNodes.length) panel.appendChild(links);
+    panel.appendChild(el("pre", "code-view",
+      doc.text || "(empty)"));
+    closeDocOverlay();
+    const overlay = el("div", "doc-overlay");
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Memory document");
+    const close = el("button", "ghost", "Close");
+    close.addEventListener("click", closeDocOverlay);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeDocOverlay(); });
+    panel.prepend(close);
+    overlay.appendChild(panel);
+    docOverlayFocus = document.activeElement;
+    document.body.appendChild(overlay);
+    docOverlay = overlay;
+    close.focus();
+  } catch (err) {
+    if (isAbort(err)) return;
+    if (gen === routeVersion) showErr(err.message);
+  }
+}
+
+async function vMemory(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Memory");
+  setNav("memory");
+  const status = await api("/api/memory/status",
+                           { signal, ws: wsId });
+
+  const stat = el("div", "panel");
+  stat.appendChild(el("h2", null, "Repository memory"));
+  stat.appendChild(el("p", null,
+    "Local-first evidence index over recorded sessions, checkpoints," +
+    " decisions, and indexed code. Lexical search only unless you" +
+    " explicitly run an AI request."));
+  const flags = el("div", "cap",
+    `documents ${status.documents} · fts5 ${status.fts5}` +
+    ` · provider ${status.provider_configured
+      ? "configured" : "not configured"}` +
+    ` · external AI ${status.external_ai_enabled
+      ? "enabled" : "disabled"}`);
+  stat.appendChild(flags);
+  if (status.indexed_repositories.length) {
+    stat.appendChild(el("div", "cap",
+      "indexed: " + status.indexed_repositories.map(
+        (r) => `${r.repo_id.slice(0, 10)}@` +
+               `${String(r.commit_sha).slice(0, 10) || "-"}`).join(", ")));
+  }
+  if (canWrite()) {
+    const idxBtn = el("button", null, "Index captured history");
+    idxBtn.addEventListener("click", async () => {
+      idxBtn.disabled = true;
+      try {
+        await api("/api/memory/index", {
+          method: "POST", ws: wsId, signal,
+          headers: { "Content-Type": "application/json" },
+          body: "{}" });
+        route();
+      } catch (err) {
+        if (isAbort(err)) return;
+        showErr(err.message);
+        idxBtn.disabled = false;
+      }
+    });
+    stat.appendChild(idxBtn);
+    stat.appendChild(el("p", "hint small",
+      "Re-indexes captured sessions, checkpoints, and decisions" +
+      " recorded in this workspace. It does not scan the filesystem" +
+      " — code documents and the graph are only built by running" +
+      " `partial index` on a repository checkout."));
+  }
+  if (canOwner()) {
+    const lab = el("label", "cap");
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.checked = !!status.external_ai_enabled;
+    cb.disabled = !status.provider_configured
+      && !status.external_ai_enabled;
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(
+      " Allow sending bounded evidence to the configured AI provider"
+      + (status.provider_configured ? ""
+        : " (provider not configured)")));
+    cb.addEventListener("change", async () => {
+      if (cb.checked && !window.confirm(
+        "Enable external AI for this workspace? Bounded evidence"
+        + " will be sent to the configured provider on explicit"
+        + " requests only. This can incur paid API usage.")) {
+        cb.checked = false;
+        return;
+      }
+      try {
+        await api("/api/memory/settings", {
+          method: "POST", ws: wsId, signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ external_ai_enabled: cb.checked }) });
+      } catch (err) {
+        if (isAbort(err)) return;
+        cb.checked = !cb.checked;
+        showErr(err.message);
+      }
+    });
+    stat.appendChild(lab);
+  }
+  root.appendChild(stat);
+
+  const kind = params.get("kind") || "";
+  const q = params.get("q") || "";
+  const repoParam = params.get("repo") || "";
+  const useSem = params.get("semantic") === "1";
+  const semAllowed = status.provider_configured
+    && status.external_ai_enabled && canWrite();
+  const repos = await repoOptions(signal, wsId);
+  const filters = el("div", "filters");
+  const qIn = el("input");
+  qIn.value = q;
+  qIn.placeholder = "Search memory…";
+  qIn.className = "wide";
+  qIn.setAttribute("aria-label", "Memory search query");
+  const rSel = el("select");
+  rSel.setAttribute("aria-label", "Repository");
+  rSel.appendChild(new Option("All repos", ""));
+  for (const r of repos) rSel.appendChild(new Option(r.name, r.id));
+  rSel.value = repoParam;
+  const go = el("button", "primary", "Search");
+  let semCb = null;
+  if (semAllowed) {
+    semCb = el("input");
+    semCb.type = "checkbox";
+    semCb.checked = useSem;
+    semCb.setAttribute("aria-label", "Semantic search");
+  }
+  const apply = (over = {}) => {
+    const p = new URLSearchParams();
+    const qv = qIn.value.trim();
+    if (qv) p.set("q", qv);
+    const kv = over.kind !== undefined ? over.kind : kind;
+    if (kv) p.set("kind", kv);
+    if (rSel.value) p.set("repo", rSel.value);
+    if (semCb && semCb.checked && semAllowed) {
+      if (qv && !window.confirm(
+        "Run semantic search? The query is embedded by the" +
+        " configured AI provider — a paid external request." +
+        " Cancel to run a local lexical search instead.")) {
+        semCb.checked = false;
+      } else {
+        p.set("semantic", "1");
+      }
+    }
+    location.hash = `#/memory?${p}`;
+  };
+  go.addEventListener("click", () => apply());
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
+  rSel.addEventListener("change", () => apply());
+
+  const kindTabs = el("div", "tabs");
+  kindTabs.setAttribute("role", "tablist");
+  kindTabs.setAttribute("aria-label", "Document kind");
+  for (const [v, l] of [["", "All"], ["code", "Code"],
+                        ["session", "Sessions"],
+                        ["checkpoint", "Checkpoints"],
+                        ["decision", "Decisions"]]) {
+    const b = el("button", v === kind ? "active" : null, l);
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", v === kind ? "true" : "false");
+    b.addEventListener("click", () => apply({ kind: v }));
+    kindTabs.appendChild(b);
+  }
+  root.appendChild(kindTabs);
+
+  const docIn = el("input");
+  docIn.placeholder = "Open document by id";
+  docIn.setAttribute("aria-label", "Open document by id");
+  const docBtn = el("button", null, "Open doc");
+  const openById = () => {
+    const v = docIn.value.trim();
+    if (v) openDoc(v, wsId);
+  };
+  docBtn.addEventListener("click", openById);
+  docIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") openById(); });
+  filters.append(qIn, rSel, go, docIn, docBtn);
+  if (q && status.external_ai_enabled && canWrite()) {
+    const askBtn = el("button", null,
+      "Send selected context to configured AI provider");
+    askBtn.addEventListener("click", async () => {
+      if (!window.confirm(
+        "Send bounded evidence to the configured AI provider?"
+        + " This is a paid external request.")) return;
+      try {
+        const out = await api("/api/workflows", {
+          method: "POST", ws: wsId, signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind: "ask", query: q, run: true,
+                                 repo_id: rSel.value || null }) });
+        showErr(`ask submitted: ${out.id.slice(0, 12)} — see Workflows`);
+      } catch (err) {
+        if (isAbort(err)) return;
+        showErr(err.message);
+      }
+    });
+    filters.appendChild(askBtn);
+  }
+  root.appendChild(filters);
+  if (semAllowed) {
+    const semLab = el("label", "cap");
+    semLab.appendChild(semCb);
+    semLab.appendChild(document.createTextNode(
+      " Semantic (sends the query embedding to the configured"
+      + " provider; paid request — asks for confirmation)"));
+    root.appendChild(semLab);
+  } else {
+    root.appendChild(el("div", "cap",
+      "Semantic search unavailable — it needs a configured AI"
+      + " provider and the external-AI policy enabled by an owner."
+      + " Lexical search never contacts a provider."));
+  }
+
+  if (!q) {
+    root.appendChild(el("div", "empty",
+      "Type a query to search indexed memory. Archived or cited" +
+      " documents can still be opened by id above."));
+    return;
+  }
+  let d;
+  if (useSem && semAllowed) {
+    d = await api("/api/memory/search", {
+      method: "POST", signal, ws: wsId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q, kind: kind || null,
+                             repo_id: repoParam || null,
+                             semantic: true }) });
+  } else {
+    const qp = new URLSearchParams({ q });
+    if (kind) qp.set("kind", kind);
+    if (repoParam) qp.set("repo", repoParam);
+    d = await api(`/api/memory/search?${qp}`,
+                  { signal, ws: wsId });
+  }
+  const p = el("div", "panel");
+  if (useSem && !semAllowed) {
+    p.appendChild(el("div", "cap",
+      "Semantic search was requested but is unavailable" +
+      " (provider or policy); showing local lexical results."));
+  }
+  if (!d.items.length) {
+    p.appendChild(el("div", "empty", `No results for "${q}".`));
+  } else {
+    p.appendChild(el("div", "cap",
+      `${d.items.length} result(s) · mode ${d.mode}`));
+    p.appendChild(table(
+      ["Title", "Kind", "Location", "Repo"],
+      d.items.map((r) => {
+        const a = el("a", null, r.title || shortId(r.id));
+        a.href = "#/memory";
+        a.addEventListener("click", (e) => {
+          e.preventDefault(); openDoc(r.id, wsId); });
+        return [a, r.kind, docLoc(r),
+                String(r.repo_id || "").slice(0, 10)];
+      })));
+  }
+  root.appendChild(p);
+}
+
+async function vGraph(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Code graph");
+  setNav("graph");
+  const q = params.get("q") || "";
+  const sym = params.get("symbol") || "";
+  const repos = await repoOptions(signal, wsId);
+  const filters = el("div", "filters");
+  const qIn = el("input");
+  qIn.value = q;
+  qIn.placeholder = "Symbol name…";
+  qIn.setAttribute("aria-label", "Symbol search");
+  const rSel = el("select");
+  rSel.setAttribute("aria-label", "Repository");
+  rSel.appendChild(new Option("All repos", ""));
+  for (const r of repos) rSel.appendChild(new Option(r.name, r.id));
+  rSel.value = params.get("repo") || "";
+  const go = el("button", "primary", "Search");
+  const apply = () => {
+    const p = new URLSearchParams();
+    if (qIn.value.trim()) p.set("q", qIn.value.trim());
+    if (rSel.value) p.set("repo", rSel.value);
+    location.hash = `#/graph?${p}`;
+  };
+  go.addEventListener("click", apply);
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
+  filters.append(qIn, rSel, go);
+  root.appendChild(filters);
+
+  const status = await api("/api/memory/status",
+                           { signal, ws: wsId });
+  root.appendChild(el("div", "cap",
+    "Coverage: python AST (definitions, same-file calls, imports);" +
+    " other languages lexical inventory only. Dynamic dispatch and" +
+    " aliases are not resolved."));
+
+  if (sym) {
+    const d = await api(
+      `/api/graph/neighbors?id=${encodeURIComponent(sym)}` +
+      (rSel.value ? `&repo=${rSel.value}` : ""),
+      { signal, ws: wsId });
+    const p = el("div", "panel");
+    p.appendChild(el("h3", null,
+      `${d.symbol.qualified_name} (${d.symbol.kind})`));
+    p.appendChild(el("div", "cap",
+      `${d.symbol.path}:${d.symbol.line}-${d.symbol.end_line} ·` +
+      ` analysis ${d.analysis}`));
+    for (const lim of d.limitations || [])
+      p.appendChild(el("div", "cap", `⚠ ${lim}`));
+    const others = (d.nodes || []).filter(
+      (n) => n.id !== d.symbol.id);
+    if (others.length) {
+      p.appendChild(el("h4", null, `Neighbor nodes (${others.length})`));
+      p.appendChild(table(
+        ["Symbol", "Kind", "File", "Lines"],
+        others.map((n) => {
+          const a = el("a", null, n.qualified_name);
+          a.href = `#/graph?symbol=${encodeURIComponent(n.id)}` +
+            (rSel.value ? `&repo=${rSel.value}` : "");
+          return [a, n.kind, n.path, `${n.line}-${n.end_line}`];
+        })));
+    }
+    if (d.edges.length)
+      p.appendChild(table(
+        ["From", "→", "To", "Kind"],
+        d.edges.map((e) => {
+          const src = (d.nodes.find((n) => n.id === e.source_id) || {});
+          const tgt = e.target_id.startsWith("import:")
+            ? { qualified_name: e.target_id.slice(7) }
+            : (d.nodes.find((n) => n.id === e.target_id) || {});
+          return [src.qualified_name || shortId(e.source_id), "→",
+                  tgt.qualified_name || shortId(e.target_id), e.kind];
+        })));
+    else
+      p.appendChild(el("div", "empty",
+        "No recorded call/import relationships for this symbol" +
+        (d.analysis === "ast"
+          ? "."
+          : " — this language is lexical inventory only.")));
+    root.appendChild(p);
+    return;
+  }
+  if (!q) {
+    root.appendChild(el("div", "empty",
+      "Search for an indexed symbol to inspect its relationships."));
+    return;
+  }
+  const qp = new URLSearchParams({ q });
+  if (rSel.value) qp.set("repo", rSel.value);
+  const d = await api(`/api/graph/search?${qp}`, { signal, ws: wsId });
+  const p = el("div", "panel");
+  if (!d.items.length) {
+    p.appendChild(el("div", "empty", `No symbols for "${q}".`));
+  } else {
+    p.appendChild(table(
+      ["Symbol", "Kind", "File", "Lines", ""],
+      d.items.map((s) => {
+        const a = el("a", null, s.qualified_name);
+        a.href = `#/graph?symbol=${encodeURIComponent(s.id)}` +
+          (rSel.value ? `&repo=${rSel.value}` : "");
+        const imp = el("button", "ghost", "impact");
+        imp.setAttribute("aria-label",
+          `Impact of ${s.qualified_name}`);
+        imp.addEventListener("click", async () => {
+          try {
+            const d2 = await api(
+              `/api/graph/impact?id=${encodeURIComponent(s.id)}` +
+              (rSel.value ? `&repo=${rSel.value}` : ""),
+              { signal, ws: wsId });
+            if (signal.aborted) return;
+            const impacted = (d2.impacted || []).filter(
+              (n) => n.id !== d2.symbol.id);
+            for (const old of p.querySelectorAll(".impact-panel"))
+              old.remove();
+            const ip = el("div", "panel impact-panel");
+            ip.appendChild(el("h3", null,
+              `Impact of ${d2.symbol.qualified_name}`));
+            ip.appendChild(el("div", "cap",
+              `${impacted.length} caller-side symbol(s)` +
+              (d2.truncated ? " (truncated at 200)" : "")));
+            for (const lim of d2.limitations || [])
+              ip.appendChild(el("div", "cap", `⚠ ${lim}`));
+            if (impacted.length) {
+              ip.appendChild(table(
+                ["Symbol", "Kind", "File", "Lines"],
+                impacted.map((n) => {
+                  const na = el("a", null, n.qualified_name);
+                  na.href = `#/graph?symbol=` +
+                    `${encodeURIComponent(n.id)}` +
+                    (rSel.value ? `&repo=${rSel.value}` : "");
+                  return [na, n.kind, n.path,
+                          `${n.line}-${n.end_line}`];
+                })));
+            } else {
+              ip.appendChild(el("div", "empty",
+                "No caller-side symbols recorded. Static analysis" +
+                " only — dynamic dispatch is not resolved."));
+            }
+            p.appendChild(ip);
+          } catch (err) {
+            if (!isAbort(err) && !signal.aborted)
+              showErr(err.message);
+          }
+        });
+        return [a, s.kind, `${s.path} (${s.analysis})`,
+                `${s.line}-${s.end_line}`, imp];
+      })));
+  }
+  root.appendChild(p);
+}
+
+async function vDecisions(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Decisions");
+  setNav("decisions");
+  const repos = await repoOptions(signal, wsId);
+  const filters = el("div", "filters");
+  const fSel = el("select");
+  fSel.setAttribute("aria-label", "Repository");
+  fSel.appendChild(new Option("All repos", ""));
+  for (const r of repos) fSel.appendChild(new Option(r.name, r.id));
+  fSel.value = params.get("repo") || "";
+  fSel.addEventListener("change", () => {
+    const p = new URLSearchParams();
+    if (fSel.value) p.set("repo", fSel.value);
+    location.hash = `#/decisions?${p}`;
+  });
+  filters.appendChild(fSel);
+  root.appendChild(filters);
+  const qp = new URLSearchParams();
+  if (params.get("repo")) qp.set("repo", params.get("repo"));
+  const d = await api(`/api/decisions?${qp}`, { signal, ws: wsId });
+  const p = el("div", "panel");
+  p.appendChild(el("h2", null, "Decisions"));
+  p.appendChild(el("p", "hint small",
+    "Decisions are append-only history — recording a decision that" +
+    " supersedes another marks the earlier one [superseded]; it is" +
+    " never deleted."));
+  if (!d.items.length)
+    p.appendChild(el("div", "empty", "No decisions recorded."));
+  else
+    for (const dec of d.items) {
+      const card = el("div", "panel");
+      card.appendChild(el("h3", null,
+        `[${dec.status}] ${dec.title}`));
+      card.appendChild(el("p", null, dec.body));
+      card.appendChild(el("div", "cap",
+        `author ${dec.author} · ${fmtDate(dec.created_at)}` +
+        (dec.supersedes
+          ? ` · supersedes ${dec.supersedes.slice(0, 12)}` : "")));
+      if (dec.source_ids && dec.source_ids.length) {
+        const sl = el("div", "cap");
+        sl.appendChild(document.createTextNode("sources: "));
+        for (const sid of dec.source_ids) {
+          const a = el("a", null, sid.slice(0, 12));
+          a.href = "#/memory";
+          a.addEventListener("click", (e) => {
+            e.preventDefault(); openDoc(sid, wsId); });
+          sl.appendChild(a);
+          sl.appendChild(document.createTextNode(" "));
+        }
+        card.appendChild(sl);
+      }
+      p.appendChild(card);
+    }
+  root.appendChild(p);
+  if (canWrite() && !repos.length) {
+    root.appendChild(el("div", "cap",
+      "Recording decisions requires a registered repository."));
+  } else if (canWrite()) {
+    const form = el("div", "panel");
+    form.appendChild(el("h3", null, "Record a decision"));
+    const rSel = el("select");
+    rSel.setAttribute("aria-label", "Repository");
+    for (const r of repos) rSel.appendChild(new Option(r.name, r.id));
+    const tIn = el("input");
+    tIn.placeholder = "Title";
+    tIn.className = "wide";
+    tIn.setAttribute("aria-label", "Decision title");
+    const bIn = el("textarea");
+    bIn.placeholder = "Body";
+    bIn.setAttribute("aria-label", "Decision body");
+    const sIn = el("input");
+    sIn.placeholder = "Source document ids (comma separated)";
+    sIn.className = "wide";
+    sIn.setAttribute("aria-label", "Source document ids");
+    const supIn = el("input");
+    supIn.placeholder = "Supersedes decision id (optional)";
+    supIn.className = "wide";
+    supIn.setAttribute("aria-label", "Supersedes decision id");
+    const btn = el("button", "primary", "Record decision");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api("/api/decisions", {
+          method: "POST", ws: wsId, signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            repo_id: rSel.value, title: tIn.value, body: bIn.value,
+            source_ids: sIn.value.split(",").map((s) => s.trim())
+              .filter(Boolean),
+            supersedes: supIn.value.trim() || null }) });
+        route();
+      } catch (err) {
+        if (isAbort(err)) return;
+        showErr(err.message);
+        btn.disabled = false;
+      }
+    });
+    form.append(rSel, tIn, bIn, sIn, supIn, btn);
+    root.appendChild(form);
+  } else {
+    root.appendChild(el("div", "cap",
+      demoMode()
+        ? "Demo workspace is read-only."
+        : "Recording decisions requires the member role."));
+  }
+}
+
+async function vDispatch(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Dispatches");
+  setNav("dispatch");
+  const repos = await repoOptions(signal, wsId);
+  const filters = el("div", "filters");
+  const since = el("input");
+  since.type = "date";
+  since.value = params.get("since") || "";
+  since.setAttribute("aria-label", "Since date");
+  const until = el("input");
+  until.type = "date";
+  until.value = params.get("until") || "";
+  until.setAttribute("aria-label", "Until date");
+  const rSel = el("select");
+  rSel.setAttribute("aria-label", "Repository");
+  rSel.appendChild(new Option("All repos", ""));
+  for (const r of repos) rSel.appendChild(new Option(r.name, r.id));
+  rSel.value = params.get("repo") || "";
+  const bIn = el("input");
+  bIn.placeholder = "branch";
+  bIn.value = params.get("branch") || "";
+  bIn.setAttribute("aria-label", "Branch");
+  const go = el("button", "primary", "Preview");
+  const apply = () => {
+    const p = new URLSearchParams();
+    if (since.value) p.set("since", since.value);
+    if (until.value) p.set("until", until.value);
+    if (rSel.value) p.set("repo", rSel.value);
+    if (bIn.value.trim()) p.set("branch", bIn.value.trim());
+    location.hash = `#/dispatch?${p}`;
+  };
+  go.addEventListener("click", apply);
+  for (const inp of [since, until, bIn])
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") apply(); });
+  rSel.addEventListener("change", apply);
+  filters.append(since, until, rSel, bIn, go);
+  root.appendChild(filters);
+  const qp = new URLSearchParams();
+  for (const k of ["since", "until", "repo", "branch"])
+    if (params.get(k)) qp.set(k, params.get(k));
+  const d = await api(`/api/dispatch?${qp}`, { signal, ws: wsId });
+  const p = el("div", "panel");
+  p.appendChild(el("h3", null, "Recorded activity"));
+  p.appendChild(el("p", "hint",
+    "Deterministic recap of recorded checkpoints — generated" +
+    " locally with no AI call. For an AI-written summary, plan and" +
+    " explicitly run a dispatch workflow from the Workflows page."));
+  const sc = d.scope || {};
+  p.appendChild(el("div", "cap",
+    `window ${sc.since || "?"} → ${sc.until || "?"}` +
+    ` · repo ${sc.repo_id ? sc.repo_id.slice(0, 10) : "all"}` +
+    ` · branch ${sc.branch || "all"}`));
+  const srcIds = d.source_ids || [];
+  if (srcIds.length === 0)
+    p.appendChild(el("div", "empty",
+      "No checkpoints recorded in this window."));
+  else {
+    p.appendChild(el("pre", "code-view", d.markdown));
+    const acts = el("div", "filters");
+    acts.appendChild(copyBtn(d.markdown));
+    const url = URL.createObjectURL(
+      new Blob([d.markdown], { type: "text/markdown" }));
+    const dl = el("a", "button", "Download markdown");
+    dl.href = url;
+    dl.download = "partial-dispatch.md";
+    acts.appendChild(dl);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    p.appendChild(acts);
+    if (d.truncated)
+      p.appendChild(el("div", "cap",
+        "⚠ Truncated at 2000 checkpoints — narrow the date window" +
+        " or the repo/branch scope."));
+    const det = el("details");
+    det.appendChild(el("summary", "hint",
+      `Source checkpoints (${srcIds.length})`));
+    for (const cid of srcIds) {
+      const a = el("a", "mono blocklink", cid.slice(0, 12));
+      a.href = `#/checkpoints/${cid}`;
+      det.appendChild(a);
+    }
+    p.appendChild(det);
+  }
+  root.appendChild(p);
+}
+
+async function vWorkflows(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Workflows");
+  setNav("workflows");
+  const status = await api("/api/memory/status",
+                           { signal, ws: wsId });
+  const repos = await repoOptions(signal, wsId);
+  const filters = el("div", "filters");
+  const fSel = el("select");
+  fSel.setAttribute("aria-label", "Repository");
+  fSel.appendChild(new Option("All repos", ""));
+  for (const r of repos) fSel.appendChild(new Option(r.name, r.id));
+  fSel.value = params.get("repo") || "";
+  fSel.addEventListener("change", () => {
+    const p2 = new URLSearchParams();
+    if (fSel.value) p2.set("repo", fSel.value);
+    location.hash = `#/workflows?${p2}`;
+  });
+  filters.appendChild(fSel);
+  root.appendChild(filters);
+  const wqp = new URLSearchParams();
+  if (params.get("repo")) wqp.set("repo", params.get("repo"));
+  const d = await api(`/api/workflows?${wqp}`, { signal, ws: wsId });
+  const p = el("div", "panel");
+  p.appendChild(el("h2", null, "Workflow runs"));
+  p.appendChild(el("p", "hint small",
+    "A workflow run assembles a bounded evidence packet. Planning" +
+    " saves the packet locally — no provider or agent is contacted." +
+    " Running sends the packet to the configured AI provider after" +
+    " your explicit confirmation; no agents run on this server."));
+  if (!d.items.length)
+    p.appendChild(el("div", "empty", "No workflow runs yet."));
+  else
+    p.appendChild(table(
+      ["Run", "Kind", "Status", "Created"],
+      d.items.map((r) => {
+        const a = el("a", null, r.id.slice(0, 12));
+        a.href = `#/workflows/${r.id}`;
+        return [a, r.kind, statusPill(r.status),
+                fmtDate(r.created_at)];
+      })));
+  root.appendChild(p);
+
+  const form = el("div", "panel");
+  form.appendChild(el("h3", null, "Plan a workflow"));
+  const kindSel = el("select");
+  kindSel.setAttribute("aria-label", "Workflow kind");
+  for (const k of ["ask", "review", "investigate", "dispatch"])
+    kindSel.appendChild(new Option(k, k));
+  const wRepo = el("select");
+  wRepo.setAttribute("aria-label", "Repository");
+  wRepo.appendChild(new Option("All repos", ""));
+  for (const r of repos) wRepo.appendChild(new Option(r.name, r.id));
+  const qIn = el("input");
+  qIn.className = "wide";
+  qIn.placeholder = "Question (ask/investigate)";
+  qIn.setAttribute("aria-label", "Workflow question");
+  const scope = el("div", "filters");
+  const wSince = el("input");
+  wSince.type = "date";
+  wSince.setAttribute("aria-label", "Dispatch since date");
+  const wUntil = el("input");
+  wUntil.type = "date";
+  wUntil.setAttribute("aria-label", "Dispatch until date");
+  const wBranch = el("input");
+  wBranch.placeholder = "branch";
+  wBranch.setAttribute("aria-label", "Dispatch branch");
+  const scopeNote = el("span", "hint small",
+    "(dispatch scope only)");
+  scope.append(wSince, wUntil, wBranch, scopeNote);
+  const runCb = el("input");
+  runCb.type = "checkbox";
+  runCb.setAttribute("aria-label", "Run with AI provider");
+  const runLab = el("label", "cap");
+  runLab.appendChild(runCb);
+  runLab.appendChild(document.createTextNode(
+    " Run with AI provider (sends bounded evidence externally;"
+    + " paid request)"));
+  if (!status.external_ai_enabled || !status.provider_configured) {
+    runCb.disabled = true;
+    runLab.appendChild(el("div", "cap",
+      status.provider_configured
+        ? "External AI is disabled; an owner can enable it under"
+          + " Memory."
+        : "No AI provider is configured on the server"
+          + " (PARTIAL_OPENAI_API_KEY)."));
+  }
+  const btn = el("button", "primary", "Submit");
+  btn.addEventListener("click", async () => {
+    if (runCb.checked && !window.confirm(
+      "Run this workflow with the configured AI provider?"
+      + " Bounded evidence is sent externally (paid request)."))
+      return;
+    btn.disabled = true;
+    try {
+      const out = await api("/api/workflows", {
+        method: "POST", ws: wsId, signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: kindSel.value, query: qIn.value,
+          repo_id: wRepo.value || null,
+          run: runCb.checked,
+          ...(wSince.value ? { since: wSince.value } : {}),
+          ...(wUntil.value ? { until: wUntil.value } : {}),
+          ...(wBranch.value.trim()
+            ? { branch: wBranch.value.trim() } : {}) }) });
+      showErr(`workflow ${out.status}: ${out.id.slice(0, 12)}`);
+      route();
+    } catch (err) {
+      if (isAbort(err)) return;
+      showErr(err.message);
+      btn.disabled = false;
+    }
+  });
+  if (canWrite()) {
+    form.append(kindSel, wRepo, qIn, scope, runLab, btn);
+    root.appendChild(form);
+  } else {
+    root.appendChild(el("div", "cap",
+      demoMode()
+        ? "Demo workspace is read-only."
+        : "Starting workflows requires the member role."));
+  }
+}
+
+async function vWorkflowDetail(root, id, signal) {
+  const wsId = currentWs && currentWs.id;
+  setCrumb("Workflow run");
+  setNav("workflows");
+  const d = await api(`/api/workflows/${encodeURIComponent(id)}`,
+                      { signal, ws: wsId });
+  const r = d.run;
+  const p = el("div", "panel");
+  const h = el("h2");
+  h.appendChild(document.createTextNode(`${r.kind} `));
+  h.appendChild(statusPill(r.status));
+  p.appendChild(h);
+  const semantics = {
+    planned: "Planned — a bounded evidence packet was saved" +
+      " locally; no external request was made.",
+    running: "Running — this page polls until the run finishes.",
+    completed: "Completed — the report below was validated against" +
+      " the evidence packet.",
+    partial: "Partial — a report was produced but one or more" +
+      " reviewers/agents failed; see the errors below.",
+    error: "Error — the run failed; see the error below.",
+    interrupted: "Interrupted — the server or CLI process exited" +
+      " before the run finished.",
+    imported: "Imported — this run arrived via a bundle and was" +
+      " not executed on this server.",
+  };
+  if (semantics[r.status])
+    p.appendChild(el("p", "hint", semantics[r.status]));
+  p.appendChild(el("div", "cap",
+    `${r.id} · created ${fmtDate(r.created_at)} ·` +
+    ` updated ${fmtDate(r.updated_at)} ·` +
+    ` sources ${(r.source_ids || []).length}`));
+  const rep = r.report || {};
+  const det = r.details || {};
+  if (rep.error)
+    p.appendChild(el("div", "notice-err", `Error: ${rep.error}`));
+  for (const w of rep.warnings || [])
+    p.appendChild(el("div", "cap", `warning: ${w}`));
+  if (r.source_ids && r.source_ids.length) {
+    const sl = el("div", "cap");
+    sl.appendChild(document.createTextNode("evidence: "));
+    for (const sid of r.source_ids) {
+      const a = el("a", null, sid.slice(0, 12));
+      a.href = "#/memory";
+      a.addEventListener("click", (e) => {
+        e.preventDefault(); openDoc(sid, wsId); });
+      sl.appendChild(a);
+      sl.appendChild(document.createTextNode(" "));
+    }
+    p.appendChild(sl);
+  }
+  const rerrs = det.reviewer_errors || [];
+  if (rerrs.length) {
+    p.appendChild(el("h3", null, "Reviewer errors"));
+    p.appendChild(table(["Agent", "Error"],
+      rerrs.map((e) => [e.agent || "?", e.error || ""])));
+  }
+  p.appendChild(el("h3", null, "Report"));
+  p.appendChild(el("pre", "code-view",
+    JSON.stringify(rep, null, 2)));
+  if (Object.keys(det).length) {
+    const dd = el("details");
+    dd.appendChild(el("summary", "hint", "Run details"));
+    dd.appendChild(el("pre", "code-view",
+      JSON.stringify(det, null, 2)));
+    p.appendChild(dd);
+  }
+  root.appendChild(p);
+  if (r.status === "running") {
+    const alive = () => !signal.aborted;
+    setTimeout(async () => {
+      if (!alive()) return;
+      try {
+        const d2 = await api(
+          `/api/workflows/${encodeURIComponent(id)}`,
+          { signal, ws: wsId });
+        if (!alive()) return;
+        if (d2.run.status !== r.status) route();
+        else setTimeout(() => { if (alive()) route(); }, 4000);
+      } catch (_) { /* noop */ }
+    }, 2000);
+  }
+}
+
 async function route() {
   if (!me) return;
   const version = ++routeVersion;
@@ -1703,6 +2858,7 @@ async function route() {
   routeCtl = new AbortController();
   const signal = routeCtl.signal;
   const current = () => version === routeVersion && !signal.aborted;
+  closeDocOverlay();
   view.textContent = "";
   view.appendChild(el("div", "loading", "Loading…"));
   const root = el("div");
@@ -1721,6 +2877,16 @@ async function route() {
     else if (page === "checkpoints")
       await vCheckpoints(root, params, signal);
     else if (page === "search") await vSearch(root, params, signal);
+    else if (page === "memory") await vMemory(root, params, signal);
+    else if (page === "graph") await vGraph(root, params, signal);
+    else if (page === "decisions")
+      await vDecisions(root, params, signal);
+    else if (page === "dispatch")
+      await vDispatch(root, params, signal);
+    else if (page === "workflows" && parts[1])
+      await vWorkflowDetail(root, parts[1], signal);
+    else if (page === "workflows")
+      await vWorkflows(root, params, signal);
     else if (page === "integrations") await vIntegrations(root, signal);
     else if (page === "settings") await vSettings(root, signal);
     else await vOverview(root, signal);

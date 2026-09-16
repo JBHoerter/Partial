@@ -18,6 +18,7 @@ EVENT_KINDS = (
     "compaction",
     "usage",
     "error",
+    "system",
 )
 
 MAX_EVENT_BYTES = 1024 * 1024

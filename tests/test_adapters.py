@@ -78,6 +78,26 @@ class DevinHookTests(unittest.TestCase):
                 normalize_hook(agent, {"session_id": "s",
                                        "hook_event_name": "Stop"})
 
+    def test_hook_extras_record_transcript_path(self):
+        # Claude-style hook payloads carry provider state paths such as
+        # transcript_path.  They are recorded verbatim under data.hook;
+        # Store.strip_paths/export sanitizes them on egress.  cwd is a
+        # core hook key and is not recorded at all.
+        ev = normalize_hook("claude", {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/repo/a.py"},
+            "transcript_path": "/home/u/.claude/projects/x/t.jsonl",
+            "cwd": "/home/u/work/repo",
+        })
+        data = ev[0].data
+        self.assertEqual(
+            data["hook"]["transcript_path"],
+            "/home/u/.claude/projects/x/t.jsonl")
+        self.assertNotIn("cwd", data["hook"])
+        self.assertNotIn("cwd", data)
+
 
 class ClaudeImportTests(unittest.TestCase):
     def test_text_and_tool_blocks(self):
@@ -198,6 +218,23 @@ class CodexImportTests(unittest.TestCase):
         self.assertEqual(
             evs[2].data["tool_input"], {"cmd": "ls"})
         self.assertNotIn("hidden", json.dumps([e.to_dict() for e in evs]))
+
+    def test_rollout_session_meta_records_cwd(self):
+        # Rollout session_meta carries the machine-local cwd verbatim;
+        # Store.strip_paths/export sanitizes it on egress.
+        lines = [
+            {"type": "session_meta", "payload": {
+                "id": "rollout-1", "cwd": "/home/u/work/repo",
+                "source": "cli"}},
+            {"type": "turn.started"},
+        ]
+        evs = parse_import(
+            "codex", "\n".join(json.dumps(x) for x in lines))
+        meta = [e for e in evs if e.kind == "session_start"]
+        self.assertEqual(len(meta), 1)
+        self.assertEqual(meta[0].data["cwd"], "/home/u/work/repo")
+        self.assertEqual(meta[0].data["native_id"], "rollout-1")
+        self.assertEqual(meta[0].data["source"], "cli")
 
     def test_codex_event_direct(self):
         evs = codex_event({"type": "turn.started"}, "t1")

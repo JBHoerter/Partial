@@ -19,6 +19,7 @@ CHECKPOINT_ID_RE = re.compile(r"[0-9a-f]{32}")
 DEVIN_HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
+    "PreToolUse",
     "PostToolUse",
     "Stop",
     "SessionEnd",
@@ -27,6 +28,7 @@ DEVIN_HOOK_EVENTS = (
 CLAUDE_HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
+    "PreToolUse",
     "PostToolUse",
     "Stop",
     "SessionEnd",
@@ -204,7 +206,7 @@ def create_checkpoint(
     if require_links and not links:
         return None
     checkpoint_id = uuid.uuid4().hex
-    return store.save_checkpoint(
+    cp = store.save_checkpoint(
         repo_id, checkpoint_id, sha,
         branch=branch,
         message=str(redact(message)) if message else None,
@@ -212,6 +214,10 @@ def create_checkpoint(
         files=files, diff=diff_text, links=links,
         worktree=resolved_wt,
     )
+    from .provenance import Provenance
+    Provenance(store).checkpoint(
+        {**repo, "root": root, "id": repo_id}, cp)
+    return cp
 
 
 def _hooks_dir(repo: dict) -> Path:

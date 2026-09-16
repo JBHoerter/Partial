@@ -391,6 +391,101 @@ class CheckpointBundleTests(RepoTestCase):
         self.assertEqual(res2["events"], 0)
 
 
+class StripEventPathsTests(RepoTestCase):
+    """Recursive path stripping in event data on egress."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store(self.home / "partial.db")
+        self.rid = self.store.register_repo(self.repo)["id"]
+        self.wt = str(Path(self.repo).resolve())
+
+    def _ingest(self):
+        self.store.ingest(self.rid, [
+            ev("e1", "s1", "session_start", agent="claude", data={
+                "native_id": "n1", "cwd": self.wt, "source": "cli"}),
+            ev("e2", "s1", "tool", agent="claude", tool_name="Edit",
+               data={
+                   "tool_input": {
+                       "file_path": self.wt + "/src/a.py",
+                       "path": "rel/b.py",
+                   },
+                   "hook": {
+                       "transcript_path":
+                           "/home/user/.claude/projects/x/t.jsonl",
+                       "nested": {"worktree": self.wt + "/sub"},
+                   },
+                   "changes": [{"path": self.wt + "/c.py",
+                                "kind": "modified"}],
+                   "note": "see /etc/hostname for details",
+               }),
+        ], worktree=self.wt)
+
+    def test_export_bundle_strips_absolute_paths(self):
+        self._ingest()
+        bundle = self.store.export_bundle(repo_id=self.rid)
+        blob = json.dumps(bundle["events"])
+        self.assertNotIn(self.wt, blob)
+        self.assertNotIn("/home/user", blob)
+        d1 = bundle["events"][0]["data"]
+        self.assertEqual(d1["cwd"], ".")
+        self.assertEqual(d1["native_id"], "n1")
+        self.assertEqual(d1["source"], "cli")
+        d2 = bundle["events"][1]["data"]
+        self.assertEqual(d2["tool_input"]["file_path"], "src/a.py")
+        self.assertEqual(d2["tool_input"]["path"], "rel/b.py")
+        self.assertEqual(
+            d2["hook"]["transcript_path"], "t.jsonl")
+        self.assertEqual(d2["hook"]["nested"]["worktree"], "sub")
+        self.assertEqual(
+            d2["changes"], [{"path": "c.py", "kind": "modified"}])
+        # Non-path text is preserved verbatim.
+        self.assertEqual(
+            d2["note"], "see /etc/hostname for details")
+
+    def test_checkpoint_bundle_strips_absolute_paths(self):
+        sid = scoped_session_id(self.rid, "claude", "s1")
+        self._ingest()
+        self.store.save_checkpoint(
+            self.rid, "c" * 32, "d" * 40, branch="main",
+            message="m", author="a", files=["c.py"], diff="patch",
+            links=[(sid, "explicit")], worktree=self.wt)
+        bundle = self.store.checkpoint_bundle("c" * 32)
+        blob = json.dumps(bundle["events"])
+        self.assertNotIn(self.wt, blob)
+        self.assertNotIn("/home/user", blob)
+        cwd = [e["data"]["cwd"] for e in bundle["events"]
+               if e["id"] == "e1"]
+        self.assertEqual(cwd, ["."])
+
+    def test_strip_paths_reduces_foreign_absolute_paths(self):
+        # Absolute paths outside every known root (provider state
+        # dirs, other worktrees) are reduced to their basename rather
+        # than passed through.
+        out = self.store.strip_paths(
+            {"hook": {"transcript_path": "/home/u/.claude/t.jsonl"},
+             "cwd": "/elsewhere/repo",
+             "tool_input": {"file_path": self.wt + "/a.py"}},
+            repo_id=self.rid)
+        self.assertEqual(
+            out["hook"]["transcript_path"], "t.jsonl")
+        self.assertEqual(out["cwd"], "repo")
+        self.assertEqual(out["tool_input"]["file_path"], "a.py")
+
+    def test_strip_paths_preserves_relative_and_text(self):
+        out = self.store.strip_paths(
+            {"tool_input": {"file_path": "src/a.py"},
+             "hook": {"transcript_path": "transcripts/t.jsonl"},
+             "note": "absolute-looking /etc/hostname in prose"},
+            repo_id=self.rid)
+        self.assertEqual(
+            out["tool_input"]["file_path"], "src/a.py")
+        self.assertEqual(
+            out["hook"]["transcript_path"], "transcripts/t.jsonl")
+        self.assertEqual(
+            out["note"], "absolute-looking /etc/hostname in prose")
+
+
 class RemoteTests(unittest.TestCase):
     def test_normalize_remote(self):
         cases = {

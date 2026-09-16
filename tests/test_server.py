@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -472,6 +474,38 @@ class ApiTests(ServerCase):
                       h["content-disposition"])
         self.assertIn(b"tokens_limit", raw)
 
+    def test_session_detail_and_handoff_strip_absolute_paths(self):
+        wt = str(Path(self.repo).resolve())
+        self.store.ingest(self.repo_id, [
+            Event(id="epath", session_id=self.sid_native,
+                  agent="devin", kind="session_start",
+                  timestamp="2026-09-16T09:00:04.000000Z",
+                  data={
+                      "cwd": wt,
+                      "hook": {
+                          "transcript_path":
+                              "/home/u/.claude/projects/x/t.jsonl"},
+                  }),
+        ], worktree=wt)
+        status, data, _, _ = self.req(
+            "GET", f"/api/sessions/{self.session_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        blob = json.dumps(data)
+        self.assertNotIn(wt, blob)
+        self.assertNotIn("/home/u", blob)
+        meta = [e for e in data["events"] if e["id"] == "epath"][0]
+        self.assertEqual(meta["data"]["cwd"], ".")
+        self.assertEqual(
+            meta["data"]["hook"]["transcript_path"], "t.jsonl")
+        status, _, raw, _ = self.req(
+            "GET", f"/api/sessions/{self.session_id}/handoff",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertNotIn(wt.encode(), raw)
+        self.assertNotIn(b"/home/u", raw)
+        self.assertIn(b"t.jsonl", raw)
+
     def test_checkpoints(self):
         status, data, _, _ = self.req(
             "GET", "/api/checkpoints", headers=self.bearer())
@@ -542,6 +576,41 @@ class ApiTests(ServerCase):
             self.assertEqual(status, 400, bad)
         self.assertEqual(self.store.stats()["sessions"], 1)
 
+    def test_bundle_attribution_native_validation_400(self):
+        origin = {"Origin": self.origin, **self.bearer()}
+        bundle = json.loads(json.dumps(self.store.export_bundle()))
+        cases = []
+        bad = json.loads(json.dumps(bundle))
+        bad["attribution"][0]["report"]["files"][0]["lines"] = [42]
+        cases.append(bad)
+        bad = json.loads(json.dumps(bundle))
+        bad["attribution"][0]["report"]["excluded"] = [
+            {"path": "ghost.py", "reason": "x"}]
+        cases.append(bad)
+        bad = {
+            "version": 1,
+            "sessions": [{
+                "id": "9" * 64, "repo_id": self.repo_id,
+                "native_id": "newsess", "agent": "devin"}],
+            "native_sessions": [{
+                "session_id": "9" * 64, "agent": "chatgpt",
+                "native_id": "newsess", "format": "native-id"}],
+        }
+        cases.append(bad)
+        bad = json.loads(json.dumps(bundle))
+        for f in bad["attribution"][0]["report"]["files"]:
+            for l in f["lines"]:
+                l["kind"] = "agent"
+                l["session_id"] = "8" * 64
+                l["evidence"] = "tool-pair"
+        cases.append(bad)
+        for b in cases:
+            status, data, _, _ = self.req(
+                "POST", "/api/bundles", b, origin)
+            self.assertEqual(status, 400, data)
+        self.assertEqual(self.store.stats()["sessions"], 1)
+        self.assertIsNone(self.store.get_session_meta("9" * 64))
+
     def test_reviews(self):
         status, data, _, _ = self.req(
             "GET", f"/api/checkpoints/{self.checkpoint_id}/reviews",
@@ -590,6 +659,630 @@ class ContextBoundsTests(unittest.TestCase):
                 f"ip-{i}": [2000.0] for i in range(4096)}
             self.assertFalse(ctx.check_login_rate("fresh-ip"))
             self.assertTrue(ctx.check_login_rate("ip-0"))
+
+
+class MemoryApiTests(ServerCase):
+    def _index(self):
+        from partial.memory import Memory
+        Memory(self.store).index(None)
+
+    def test_memory_search_and_document(self):
+        self._index()
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/status", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertTrue(data["fts5"])
+        self.assertFalse(data["external_ai_enabled"])
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/search?q=tokens_limit",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertTrue(data["items"])
+        did = data["items"][0]["id"]
+        status, data, _, _ = self.req(
+            "GET", f"/api/memory/documents/{did}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["document"]["id"], did)
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/context?q=tokens_limit",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["mode"], "lexical")
+
+    def test_memory_index_member_only(self):
+        status, data, _, _ = self.req(
+            "POST", "/api/memory/index", {},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 200)
+        status, data, _, _ = self.req(
+            "POST", f"/api/workspaces/{self.ws_id}/tokens",
+            {"name": "v", "role": "viewer"},
+            {"Origin": self.origin, "Cookie": self.owner_cookie})
+        self.assertEqual(status, 201, data)
+        vtoken = data["item"]["token"]
+        status, data, _, _ = self.req(
+            "POST", "/api/memory/index", {},
+            {"Authorization": f"Bearer {vtoken}"})
+        self.assertEqual(status, 403)
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/search?q=tokens_limit",
+            headers={"Authorization": f"Bearer {vtoken}"})
+        self.assertEqual(status, 200)
+
+    def test_decisions_api_and_roles(self):
+        self._index()
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/search?q=tokens_limit",
+            headers=self.bearer())
+        doc_id = data["items"][0]["id"]
+        status, data, _, _ = self.req(
+            "POST", "/api/decisions",
+            {"repo_id": self.repo_id, "title": "cap page size",
+             "body": "limit 100", "source_ids": [doc_id]},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 201, data)
+        status, data, _, _ = self.req(
+            "GET", f"/api/decisions?repo={self.repo_id}",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["items"][0]["title"], "cap page size")
+        status, data, _, _ = self.req(
+            "POST", "/api/decisions",
+            {"repo_id": self.repo_id, "title": "x",
+             "body": "y", "source_ids": ["0" * 64]},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 400)
+        status, data, _, _ = self.req(
+            "POST", "/api/decisions",
+            {"repo_id": "0" * 64, "title": "x", "body": "y"},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 404)
+
+    def test_dispatch_and_workflows_api(self):
+        status, data, _, _ = self.req(
+            "GET", "/api/dispatch", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertIn("markdown", data)
+        status, data, _, _ = self.req(
+            "POST", "/api/workflows",
+            {"kind": "ask", "query": "what changed", "run": False},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "planned")
+        rid = data["id"]
+        status, data, _, _ = self.req(
+            "GET", f"/api/workflows/{rid}", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(data["run"]["status"], "planned")
+        status, data, _, _ = self.req(
+            "POST", "/api/workflows",
+            {"kind": "ask", "query": "q", "run": True},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 403)
+
+    def test_memory_settings_owner_only(self):
+        status, data, _, _ = self.req(
+            "POST", "/api/memory/settings",
+            {"external_ai_enabled": True},
+            {"Origin": self.origin, **self.bearer()})
+        # member token cannot administer; also provider unconfigured
+        self.assertIn(status, (400, 403))
+
+    def test_usage_endpoints(self):
+        status, data, _, _ = self.req(
+            "GET", f"/api/sessions/{self.session_id}/usage",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertIn("basis", data["usage"])
+        status, data, _, _ = self.req(
+            "GET", f"/api/checkpoints/{self.checkpoint_id}/usage",
+            headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["sessions"]), 1)
+
+    def test_projects_api(self):
+        status, data, _, _ = self.req(
+            "POST", "/api/projects", {"name": "web"},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 201, data)
+        pid = data["item"]["id"]
+        status, data, _, _ = self.req(
+            "POST", f"/api/projects/{pid}/attach",
+            {"repo_id": self.repo_id},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 200)
+        self.assertIn(self.repo_id, data["item"]["repos"])
+        status, data, _, _ = self.req(
+            "GET", "/api/projects", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["items"]), 1)
+        status, data, _, _ = self.req(
+            "POST", f"/api/projects/{pid}/attach",
+            {"repo_id": "0" * 64},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 404)
+
+    def test_workspace_isolation_memory(self):
+        cookie = self.login()
+        status, data, _, _ = self.req(
+            "POST", "/api/workspaces", {"name": "other"},
+            {"Origin": self.origin, "Cookie": cookie})
+        self.assertEqual(status, 201, data)
+        ws2 = data["item"]["id"]
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/search?q=tokens_limit",
+            headers={"Cookie": cookie, "X-Partial-Workspace": ws2})
+        self.assertEqual(status, 200)
+        self.assertEqual(data["items"], [])
+        status, data, _, _ = self.req(
+            "POST", "/api/decisions",
+            {"repo_id": self.repo_id, "title": "x", "body": "y"},
+            {"Origin": self.origin, "Cookie": cookie,
+             "X-Partial-Workspace": ws2})
+        self.assertEqual(status, 404)
+        status, data, _, _ = self.req(
+            "GET", f"/api/workflows/{"0" * 64}",
+            headers={"Cookie": cookie, "X-Partial-Workspace": ws2})
+        self.assertEqual(status, 404)
+
+
+class _FakeProvider:
+    configured = True
+
+    def __init__(self, *args, **kwargs):
+        self.embed_calls = []
+        self.complete_calls = []
+        self.error = None
+
+    def embed(self, texts):
+        self.embed_calls.append(list(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    def complete(self, system, user):
+        self.complete_calls.append((system, user))
+        if self.error is not None:
+            raise self.error
+        return {"answer": "bounded answer", "citations": [],
+                "uncertainties": []}
+
+
+def _dead_pid():
+    pid = 400000
+    while True:
+        try:
+            os.kill(pid, 0)
+            pid += 1
+        except ProcessLookupError:
+            return pid
+        except PermissionError:
+            pid += 1
+
+
+class SecurityAuditTests(ServerCase):
+    def _token(self, role, name="scoped"):
+        status, data, _, _ = self.req(
+            "POST", f"/api/workspaces/{self.ws_id}/tokens",
+            {"name": name, "role": role},
+            {"Origin": self.origin, "Cookie": self.owner_cookie})
+        self.assertEqual(status, 201, data)
+        return data["item"]["token"]
+
+    def _index(self):
+        from partial.memory import Memory
+        Memory(self.store).index(None)
+
+    def _enable_ai(self):
+        cookie = self.login()
+        status, data, _, _ = self.req(
+            "POST", "/api/memory/settings",
+            {"external_ai_enabled": True},
+            {"Origin": self.origin, "Cookie": cookie})
+        self.assertEqual(status, 200, data)
+
+    def _wait_status(self, rid, *, timeout=10):
+        deadline = time.time() + timeout
+        data = None
+        while time.time() < deadline:
+            status, data, _, _ = self.req(
+                "GET", f"/api/workflows/{rid}",
+                headers=self.bearer())
+            self.assertEqual(status, 200, data)
+            if data["run"]["status"] != "running":
+                return data["run"]
+            time.sleep(0.05)
+        self.fail(f"run {rid} still running")
+
+    def test_get_search_context_never_semantic(self):
+        self._index()
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider") as provider:
+            inst = provider.return_value
+            status, data, _, _ = self.req(
+                "GET",
+                "/api/memory/search?q=tokens_limit&semantic=true",
+                headers=self.bearer())
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["mode"], "lexical")
+            status, data, _, _ = self.req(
+                "GET",
+                "/api/memory/context?q=tokens_limit&semantic=1",
+                headers=self.bearer())
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["mode"], "lexical")
+            inst.embed.assert_not_called()
+            inst.complete.assert_not_called()
+
+    def test_get_search_limit_validation(self):
+        for bad in ("abc", "0", "-1", "101", "1.5"):
+            status, _, _, _ = self.req(
+                "GET", f"/api/memory/search?q=tokens_limit&limit={bad}",
+                headers=self.bearer())
+            self.assertEqual(status, 400, bad)
+
+    def test_post_search_strict_validation(self):
+        origin = {"Origin": self.origin, **self.bearer()}
+        for bad in (
+            {"semantic": False},
+            {"query": 42},
+            {"query": ""},
+            {"query": "  "},
+            {"query": "x" * 501},
+            {"query": "q", "repo_id": "nothex"},
+            {"query": "q", "kind": "bogus"},
+            {"query": "q", "limit": "10"},
+            {"query": "q", "limit": True},
+            {"query": "q", "limit": 0},
+            {"query": "q", "limit": 101},
+            {"query": "q", "semantic": 1},
+            {"query": "q", "semantic": "yes"},
+        ):
+            status, _, _, _ = self.req(
+                "POST", "/api/memory/search", bad, origin)
+            self.assertEqual(status, 400, bad)
+        status, _, _, _ = self.req(
+            "POST", "/api/memory/search",
+            {"query": "q", "repo_id": "0" * 64}, origin)
+        self.assertEqual(status, 404)
+
+    def test_post_search_semantic_gating(self):
+        self._index()
+        origin = {"Origin": self.origin, **self.bearer()}
+        body = {"query": "tokens_limit", "semantic": True}
+        status, _, _, _ = self.req(
+            "POST", "/api/memory/search", body, origin)
+        self.assertEqual(status, 403)
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider", _FakeProvider):
+            self._enable_ai()
+            status, data, _, _ = self.req(
+                "POST", "/api/memory/index", {"semantic": True},
+                origin)
+            self.assertEqual(status, 200, data)
+            status, data, _, _ = self.req(
+                "POST", "/api/memory/search", body, origin)
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["mode"], "hybrid")
+            self.assertTrue(data["items"])
+
+    def test_post_search_lexical_no_provider_call(self):
+        self._index()
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider") as provider:
+            inst = provider.return_value
+            status, data, _, _ = self.req(
+                "POST", "/api/memory/search",
+                {"query": "tokens_limit", "semantic": False},
+                {"Origin": self.origin, **self.bearer()})
+            self.assertEqual(status, 200, data)
+            self.assertEqual(data["mode"], "lexical")
+            inst.embed.assert_not_called()
+            inst.complete.assert_not_called()
+
+    def test_memory_settings_owner_only_provider_gate(self):
+        cookie = self.login()
+        member = self._token("member", "m")
+        viewer = self._token("viewer", "v")
+        for headers in (
+            {"Authorization": f"Bearer {member}"},
+            {"Authorization": f"Bearer {viewer}"},
+            {"Origin": self.origin,
+             "Authorization": f"Bearer {member}"},
+        ):
+            status, _, _, _ = self.req(
+                "POST", "/api/memory/settings",
+                {"external_ai_enabled": True}, headers)
+            self.assertEqual(status, 403, headers)
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop("PARTIAL_OPENAI_API_KEY", None)
+            for body in ({"external_ai_enabled": True},
+                         {"external_ai_enabled": "yes"}):
+                status, _, _, _ = self.req(
+                    "POST", "/api/memory/settings", body,
+                    {"Origin": self.origin, "Cookie": cookie})
+                self.assertEqual(status, 400, body)
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider", _FakeProvider):
+            status, data, _, _ = self.req(
+                "POST", "/api/memory/settings",
+                {"external_ai_enabled": True},
+                {"Origin": self.origin, "Cookie": cookie})
+            self.assertEqual(status, 200, data)
+            status, data, _, _ = self.req(
+                "POST", "/api/memory/settings",
+                {"external_ai_enabled": False},
+                {"Origin": self.origin, "Cookie": cookie})
+            self.assertEqual(status, 200, data)
+            self.assertFalse(data["external_ai_enabled"])
+
+    def test_viewer_role_enforcement(self):
+        self._index()
+        vtoken = self._token("viewer", "viewer")
+        vh = {"Authorization": f"Bearer {vtoken}"}
+        for path in (
+            "/api/memory/status",
+            "/api/memory/search?q=tokens_limit",
+            "/api/memory/context?q=tokens_limit",
+            "/api/decisions",
+            "/api/dispatch",
+            "/api/workflows",
+            "/api/projects",
+        ):
+            status, _, _, _ = self.req("GET", path, headers=vh)
+            self.assertEqual(status, 200, path)
+        for path, body in (
+            ("/api/memory/index", {}),
+            ("/api/memory/search", {"query": "q"}),
+            ("/api/memory/settings",
+             {"external_ai_enabled": False}),
+            ("/api/decisions",
+             {"repo_id": self.repo_id, "title": "t", "body": "b"}),
+            ("/api/workflows", {"kind": "ask", "query": "q"}),
+            ("/api/projects", {"name": "p"}),
+            ("/api/bundles", {"version": 1}),
+        ):
+            status, _, _, _ = self.req(
+                "POST", path, body,
+                {"Origin": self.origin, **vh})
+            self.assertEqual(status, 403, path)
+
+    def test_workflow_post_validation_no_run_created(self):
+        origin = {"Origin": self.origin, **self.bearer()}
+        self.assertEqual(self.store.list_runs(), [])
+        for bad, want in (
+            ({"kind": "bogus", "query": "q"}, 400),
+            ({"query": "q"}, 400),
+            ({"kind": "ask", "query": "q", "repo_id": "zz"}, 404),
+            ({"kind": "ask", "query": "q",
+              "repo_id": "0" * 64}, 404),
+            ({"kind": "ask", "query": 12}, 400),
+            ({"kind": "ask", "query": "q", "run": "yes"}, 400),
+            ({"kind": "ask", "query": "q", "run": 1}, 400),
+            ({"kind": "ask", "query": "q", "semantic": 1}, 400),
+            ({"kind": "ask", "query": "q", "since": 5}, 400),
+            ({"kind": "dispatch", "until": {"x": 1}}, 400),
+            ({"kind": "dispatch", "branch": ["main"]}, 400),
+            ({"kind": "ask", "query": "q",
+              "agents": ["codex"]}, 400),
+            ({"kind": "ask", "query": "q",
+              "agents": "codex"}, 400),
+            ({"kind": "ask", "query": "q", "run": True}, 403),
+        ):
+            status, _, _, _ = self.req(
+                "POST", "/api/workflows", bad, origin)
+            self.assertEqual(status, want, bad)
+            self.assertEqual(self.store.list_runs(), [], bad)
+
+    def test_workflow_run_completes_and_hides_internals(self):
+        self._index()
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider", _FakeProvider):
+            self._enable_ai()
+            status, data, _, _ = self.req(
+                "POST", "/api/workflows",
+                {"kind": "ask", "query": "tokens_limit",
+                 "run": True},
+                {"Origin": self.origin, **self.bearer()})
+            self.assertEqual(status, 202, data)
+            run = self._wait_status(data["id"])
+            self.assertIn(run["status"], ("completed", "error"))
+            self.assertNotIn("run_owner", run["details"])
+            self.assertNotIn("runner", run["details"])
+            self.assertNotIn("pid", run["details"])
+
+    def test_workflow_exception_persists_terminal_error(self):
+        self.store.set_memory_setting("external_ai_enabled", "true")
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider", _FakeProvider), \
+                unittest.mock.patch(
+                    "partial.workflows.run_workflow",
+                    side_effect=RuntimeError("kaput")):
+            status, data, _, _ = self.req(
+                "POST", "/api/workflows",
+                {"kind": "ask", "query": "q", "run": True},
+                {"Origin": self.origin, **self.bearer()})
+            self.assertEqual(status, 202, data)
+            run = self._wait_status(data["id"])
+            self.assertEqual(run["status"], "error")
+            self.assertIn("kaput", run["report"]["error"])
+
+    def test_workflow_bounded_concurrency_and_release(self):
+        self.store.set_memory_setting("external_ai_enabled", "true")
+        gate = threading.Event()
+        entered = []
+        elock = threading.Lock()
+
+        def slow(store, kind, **kw):
+            with elock:
+                entered.append(kw.get("run_id"))
+            gate.wait(15)
+            return {"id": kw.get("run_id"), "status": "completed"}
+
+        origin = {"Origin": self.origin, **self.bearer()}
+        with unittest.mock.patch(
+                "partial.ai.OpenAIProvider", _FakeProvider), \
+                unittest.mock.patch(
+                    "partial.workflows.run_workflow", slow):
+            ids = []
+            for _ in range(4):
+                status, data, _, _ = self.req(
+                    "POST", "/api/workflows",
+                    {"kind": "ask", "query": "q", "run": True},
+                    origin)
+                self.assertEqual(status, 202, data)
+                ids.append(data["id"])
+            deadline = time.time() + 10
+            while len(entered) < 4 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(len(entered), 4)
+            status, _, _, _ = self.req(
+                "POST", "/api/workflows",
+                {"kind": "ask", "query": "q", "run": True},
+                origin)
+            self.assertEqual(status, 429)
+            gate.set()
+            for rid in ids:
+                run = self._wait_status(rid)
+                self.assertNotEqual(run["status"], "running")
+            status, data, _, _ = self.req(
+                "POST", "/api/workflows",
+                {"kind": "ask", "query": "q", "run": True},
+                origin)
+            self.assertEqual(status, 202, data)
+            self._wait_status(data["id"])
+
+    def test_stale_run_recovery_only_local_dead(self):
+        ctx = self.server.partial_context
+        dead = _dead_pid()
+        (rid_dead, rid_live, rid_none, rid_own,
+         rid_ldead, rid_llive) = (
+            "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+            "5" * 64, "4" * 64)
+        # save_run always stamps this process's private run_owner and
+        # strips caller-supplied ownership keys, so foreign and legacy
+        # markers are written directly to simulate older databases.
+        for rid in (rid_dead, rid_live, rid_none, rid_own,
+                    rid_ldead, rid_llive):
+            self.store.save_run(
+                rid, "ask", self.repo_id, "running", [], {}, {})
+        ctx.track_run(rid_own)
+        ctx.untrack_run(rid_own)
+        conn = self.store._connect()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE workflow_runs SET details=? WHERE id=?",
+                    (json.dumps({"run_owner": f"{dead}-foreign"}),
+                     rid_dead))
+                conn.execute(
+                    "UPDATE workflow_runs SET details=? WHERE id=?",
+                    (json.dumps(
+                        {"run_owner": f"{os.getpid()}-other"}),
+                     rid_live))
+                # Legacy pre-run_owner server runner/pid markers.
+                conn.execute(
+                    "UPDATE workflow_runs SET details=? WHERE id=?",
+                    (json.dumps({"runner": "old-server", "pid": dead}),
+                     rid_ldead))
+                conn.execute(
+                    "UPDATE workflow_runs SET details=? WHERE id=?",
+                    (json.dumps({"runner": "old-server",
+                                 "pid": os.getpid()}),
+                     rid_llive))
+        finally:
+            conn.close()
+        ctx.cleaned_stores.clear()
+        status, data, _, _ = self.req(
+            "GET", "/api/workflows", headers=self.bearer())
+        self.assertEqual(status, 200, data)
+        self.assertEqual(
+            self.store.get_run(rid_dead)["status"], "interrupted")
+        self.assertEqual(
+            self.store.get_run(rid_own)["status"], "interrupted")
+        self.assertEqual(
+            self.store.get_run(rid_ldead)["status"], "interrupted")
+        self.assertEqual(
+            self.store.get_run(rid_live)["status"], "running")
+        self.assertEqual(
+            self.store.get_run(rid_llive)["status"], "running")
+        self.assertEqual(
+            self.store.get_run(rid_none)["status"], "running")
+        # API responses never expose internal ownership identifiers.
+        for item in data["items"]:
+            det = item.get("details") or {}
+            for key in ("run_owner", "runner", "pid"):
+                self.assertNotIn(key, det, item.get("id"))
+
+    def test_cross_workspace_404_resources(self):
+        self._index()
+        status, data, _, _ = self.req(
+            "GET", "/api/memory/search?q=tokens_limit",
+            headers=self.bearer())
+        doc_id = data["items"][0]["id"]
+        self.store.save_run(
+            "e" * 64, "ask", self.repo_id, "completed", [],
+            {"answer": "x"}, {})
+        cookie = self.login()
+        status, data, _, _ = self.req(
+            "POST", "/api/workspaces", {"name": "ws2"},
+            {"Origin": self.origin, "Cookie": cookie})
+        self.assertEqual(status, 201, data)
+        ws2 = data["item"]["id"]
+        h2 = {"Cookie": cookie, "X-Partial-Workspace": ws2}
+        for path in (
+            f"/api/memory/documents/{doc_id}",
+            f"/api/workflows/{'e' * 64}",
+            f"/api/repos/{self.repo_id}",
+        ):
+            status, _, _, _ = self.req("GET", path, headers=h2)
+            self.assertEqual(status, 404, path)
+        status, data, _, _ = self.req(
+            "GET", "/api/projects", headers=h2)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["items"], [])
+        status, _, _, _ = self.req(
+            "POST", "/api/workflows",
+            {"kind": "ask", "query": "q",
+             "repo_id": self.repo_id},
+            {"Origin": self.origin, **h2})
+        self.assertEqual(status, 404)
+        status, data, _, _ = self.req(
+            "POST", "/api/projects", {"name": "p2"},
+            {"Origin": self.origin, **h2})
+        self.assertEqual(status, 201, data)
+        pid = data["item"]["id"]
+        status, _, _, _ = self.req(
+            "POST", f"/api/projects/{pid}/attach",
+            {"repo_id": self.repo_id},
+            {"Origin": self.origin, **h2})
+        self.assertEqual(status, 404)
+        status, _, _, _ = self.req(
+            "GET", "/api/memory/status",
+            headers={"Cookie": cookie,
+                     "X-Partial-Workspace": "f" * 32})
+        self.assertEqual(status, 404)
+        status, _, _, _ = self.req(
+            "GET", "/api/memory/status",
+            headers={**self.bearer(),
+                     "X-Partial-Workspace": ws2})
+        self.assertEqual(status, 404)
+
+    def test_errors_bounded_no_traceback(self):
+        with unittest.mock.patch.object(
+                Store, "list_runs",
+                side_effect=RuntimeError("secret-boom")):
+            status, data, _, _ = self.req(
+                "GET", "/api/workflows", headers=self.bearer())
+        self.assertEqual(status, 500)
+        self.assertEqual(data["error"], "internal server error")
+        self.assertNotIn("Traceback", json.dumps(data))
+        status, data, _, _ = self.req(
+            "POST", "/api/decisions",
+            {"repo_id": self.repo_id, "title": "t",
+             "body": "b", "source_ids": [1, 2, 3]},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 400, data)
+        self.assertLessEqual(len(data["error"]), 400)
 
 
 class DemoTests(RepoTestCase):
