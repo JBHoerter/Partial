@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "partial"
+version = "0.1.0"
+description = "Local-first AI session tracker with git commit checkpoints"
+readme = "AGENTS.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+partial = "partial.cli:main"
+
+[tool.setuptools]
+packages = ["partial"]
+
+[tool.setuptools.package-data]
+partial = ["static/*"]
