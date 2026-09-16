@@ -384,6 +384,44 @@ class ServerCliTests(RepoTestCase):
         code, _ = self._run(["ingest-bundle", str(f)])
         self.assertEqual(code, 2)
 
+    def test_account_create_and_token(self):
+        code, out = self._run(
+            ["account", "create", "--email", "a@x.test",
+             "--name", "A", "--password-stdin"],
+            stdin="password-one-two\n")
+        self.assertEqual(code, 0)
+        self.assertIn("a@x.test", out)
+        code, _ = self._run(["auth", "token"])
+        self.assertEqual(code, 2)
+        code, _ = self._run(
+            ["account", "create", "--email", "b@x.test",
+             "--name", "B", "--password-stdin"],
+            stdin="password-one-two\n")
+        self.assertEqual(code, 2)
+        from partial.accounts import Accounts
+        acc = Accounts(self.home, self.home / "partial.db")
+        principal = acc.check_password("a@x.test", "password-one-two")
+        ws = acc.workspaces(principal)[0]
+        code, out = self._run(
+            ["account", "token", "--email", "a@x.test",
+             "--workspace", ws["id"], "--name", "ci",
+             "--password-stdin"], stdin="password-one-two\n")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.strip().startswith("ptk_"))
+        code, _ = self._run(
+            ["account", "token", "--email", "a@x.test",
+             "--workspace", ws["id"], "--name", "ci",
+             "--password-stdin"], stdin="wrong password\n")
+        self.assertEqual(code, 2)
+        for role in ("admin", "owner"):
+            with self.assertRaises(SystemExit) as cm:
+                self._run(
+                    ["account", "token", "--email", "a@x.test",
+                     "--workspace", ws["id"], "--name", "ci",
+                     "--role", role, "--password-stdin"],
+                    stdin="password-one-two\n")
+            self.assertEqual(cm.exception.code, 2)
+
     def test_upload_validation(self):
         code, _ = self._run(["upload", "http://example.com"])
         self.assertEqual(code, 2)

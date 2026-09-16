@@ -9,8 +9,13 @@ const demoBanner = document.getElementById("demo-banner");
 const logoutBtn = document.getElementById("logout-btn");
 
 let me = null;
+let authStatus = null;
+let currentWs = null;
 let routeVersion = 0;
 let routeCtl = null;
+
+const WS_KEY = "partial_workspace_id";
+const ROLE_RANK = { viewer: 0, member: 1, admin: 2, owner: 3 };
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -33,17 +38,50 @@ class HttpError extends Error {
   }
 }
 
+function demoMode() { return !!(me && me.demo); }
+
+function wsHeaders(extra, wsId) {
+  const h = { ...(extra || {}) };
+  const id = wsId !== undefined ? wsId
+    : (currentWs && currentWs.id);
+  if (id && !demoMode()) {
+    h["X-Partial-Workspace"] = id;
+  }
+  return h;
+}
+
 async function api(path, opts = {}) {
   const init = { credentials: "same-origin", ...opts };
+  init.headers = wsHeaders(init.headers, opts.ws);
   const res = await fetch(path, init);
   let data = null;
   const ct = res.headers.get("Content-Type") || "";
   if (ct.includes("json")) data = await res.json().catch(() => null);
   if (!res.ok) {
-    if (res.status === 401 && !me?.demo) showLogin();
-    throw new HttpError(res.status, (data && data.error) || `HTTP ${res.status}`);
+    if (res.status === 401 && !me?.demo) showLogin("signin");
+    throw new HttpError(res.status,
+      (data && data.error) || `HTTP ${res.status}`);
   }
   return data;
+}
+
+async function fetchBlob(path, filename, wsId) {
+  try {
+    const res = await fetch(path, {
+      credentials: "same-origin", headers: wsHeaders(null, wsId) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (err) {
+    showErr(err.message || "Download failed");
+  }
 }
 
 function setSidebarOpen(open) {
@@ -51,8 +89,15 @@ function setSidebarOpen(open) {
   menubtn.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
-function showLogin() {
+const LOGIN_SUBS = {
+  signin: "Sign in to this workspace",
+  setup: "Create the first workspace account",
+  invite: "Accept a workspace invitation",
+};
+
+function showLogin(mode) {
   me = null;
+  currentWs = null;
   routeVersion++;
   if (routeCtl) routeCtl.abort();
   view.textContent = "";
@@ -62,6 +107,23 @@ function showLogin() {
   demoBanner.hidden = true;
   shell.hidden = true;
   loginWrap.hidden = false;
+  mode = mode || "signin";
+  document.getElementById("login-form").hidden = mode !== "signin";
+  document.getElementById("setup-form").hidden = mode !== "setup";
+  document.getElementById("invite-form").hidden = mode !== "invite";
+  const toggle = document.getElementById("invite-toggle");
+  toggle.hidden = mode === "setup";
+  toggle.textContent = mode === "invite"
+    ? "Back to sign-in" : "Have an invitation token?";
+  document.getElementById("login-sub").textContent =
+    LOGIN_SUBS[mode] || LOGIN_SUBS.signin;
+  document.getElementById("login-hint").hidden = mode !== "setup";
+  const errEl = document.getElementById("login-error");
+  errEl.textContent = "";
+  const focusId = { signin: "login-email", setup: "setup-email",
+                    invite: "invite-token" }[mode];
+  const f = focusId && document.getElementById(focusId);
+  if (f) f.focus();
 }
 
 function showApp() {
@@ -69,30 +131,90 @@ function showApp() {
   shell.hidden = false;
 }
 
-document.getElementById("login-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const input = document.getElementById("login-token");
-  const errEl = document.getElementById("login-error");
-  errEl.textContent = "";
-  const token = input.value;
-  try {
-    const res = await fetch("/api/login", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-    const data = await res.json().catch(() => null);
-    if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
-    input.value = "";
-    input.removeAttribute("value");
-    await boot();
-  } catch (err) {
-    errEl.textContent = err.message || "Sign-in failed";
-  } finally {
-    input.value = "";
+async function postAuth(path, obj) {
+  const res = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(obj),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
   }
-});
+  return data;
+}
+
+document.getElementById("invite-toggle")
+  .addEventListener("click", () => {
+    const invite = document.getElementById("invite-form");
+    showLogin(invite.hidden ? "invite" : "signin");
+  });
+
+document.getElementById("login-form")
+  .addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = document.getElementById("login-email").value.trim();
+    const pwIn = document.getElementById("login-password");
+    const errEl = document.getElementById("login-error");
+    errEl.textContent = "";
+    try {
+      await postAuth("/api/login", { email, password: pwIn.value });
+      pwIn.value = "";
+      await boot();
+    } catch (err) {
+      errEl.textContent = err.message || "Sign-in failed";
+    } finally {
+      pwIn.value = "";
+    }
+  });
+
+document.getElementById("setup-form")
+  .addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("login-error");
+    errEl.textContent = "";
+    const pw = document.getElementById("setup-password");
+    const bt = document.getElementById("setup-bootstrap");
+    try {
+      await postAuth("/api/setup", {
+        email: document.getElementById("setup-email").value.trim(),
+        name: document.getElementById("setup-name").value.trim(),
+        password: pw.value,
+        bootstrap_token: bt.value,
+      });
+      pw.value = ""; bt.value = "";
+      await boot();
+    } catch (err) {
+      errEl.textContent = err.message || "Setup failed";
+    } finally {
+      pw.value = ""; bt.value = "";
+    }
+  });
+
+document.getElementById("invite-form")
+  .addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("login-error");
+    errEl.textContent = "";
+    const tok = document.getElementById("invite-token");
+    const pw = document.getElementById("invite-password");
+    try {
+      await postAuth("/api/invites/accept", {
+        token: tok.value.trim(),
+        email: document.getElementById("invite-email").value.trim(),
+        name: document.getElementById("invite-name").value.trim(),
+        password: pw.value,
+      });
+      tok.value = ""; pw.value = "";
+      showLogin("signin");
+      document.getElementById("login-error").textContent =
+        "Invitation accepted — sign in with your new password.";
+    } catch (err) {
+      errEl.textContent = err.message || "Invitation failed";
+      pw.value = "";
+    }
+  });
 
 logoutBtn.addEventListener("click", async () => {
   try {
@@ -107,7 +229,8 @@ logoutBtn.addEventListener("click", async () => {
     showErr(err.message || "Sign-out failed");
     return;
   }
-  showLogin();
+  localStorage.removeItem(WS_KEY);
+  showLogin("signin");
 });
 
 menubtn.addEventListener("click", () => {
@@ -203,7 +326,8 @@ function sessionLink(s) {
 }
 
 function checkpointLink(c) {
-  const a = el("a", "mono", (c.commit_sha || "").slice(0, 10) || shortId(c.id));
+  const a = el("a", "mono",
+    (c.commit_sha || "").slice(0, 10) || shortId(c.id));
   a.href = `#/checkpoints/${c.id}`;
   a.title = c.message || "";
   return a;
@@ -245,22 +369,55 @@ function pager(hasMore, offset, limit, go) {
   return p;
 }
 
-async function repoOptions(signal) {
-  const d = await api("/api/repos", { signal });
+async function repoOptions(signal, wsId) {
+  const d = await api("/api/repos", { signal, ws: wsId });
   return d.items || [];
 }
 
-function demoMode() { return !!(me && me.demo); }
+function pickWorkspace() {
+  const list = me.workspaces || [];
+  const saved = localStorage.getItem(WS_KEY);
+  currentWs = list.find((w) => w.id === saved)
+    || me.workspace || list[0] || null;
+  if (currentWs) localStorage.setItem(WS_KEY, currentWs.id);
+}
+
+function renderWsSelect() {
+  const sel = document.getElementById("ws-select");
+  sel.textContent = "";
+  for (const w of me.workspaces || []) {
+    const o = new Option(w.name, w.id);
+    sel.appendChild(o);
+  }
+  if (currentWs) sel.value = currentWs.id;
+  sel.disabled = demoMode() || (me.workspaces || []).length < 2;
+}
+
+document.getElementById("ws-select")
+  .addEventListener("change", (e) => {
+    const w = (me.workspaces || []).find((x) => x.id === e.target.value);
+    if (!w || w === currentWs) return;
+    currentWs = w;
+    localStorage.setItem(WS_KEY, w.id);
+    routeVersion++;
+    if (routeCtl) routeCtl.abort();
+    view.textContent = "";
+    document.getElementById("user-label").textContent =
+      `${me.user.name} · ${w.role}`;
+    location.hash = "#/overview";
+    route();
+  });
 
 async function vOverview(root, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Overview");
   setNav("overview");
   const [ov, sessions, integ, repos, cps] = await Promise.all([
-    api("/api/overview", { signal }),
-    api("/api/sessions?limit=8", { signal }),
-    api("/api/integrations", { signal }),
-    api("/api/repos", { signal }),
-    api("/api/checkpoints?limit=8", { signal }),
+    api("/api/overview", { signal, ws: wsId }),
+    api("/api/sessions?limit=8", { signal, ws: wsId }),
+    api("/api/integrations", { signal, ws: wsId }),
+    api("/api/repos", { signal, ws: wsId }),
+    api("/api/checkpoints?limit=8", { signal, ws: wsId }),
   ]);
 
   const hero = el("div", "panel hero");
@@ -339,9 +496,10 @@ function emptySetup() {
 }
 
 async function vRepos(root, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Repositories");
   setNav("repos");
-  const d = await api("/api/repos", { signal });
+  const d = await api("/api/repos", { signal, ws: wsId });
   const p = el("div", "panel");
   p.appendChild(el("h2", null, "Repositories"));
   if (!d.items.length) {
@@ -360,19 +518,22 @@ async function vRepos(root, signal) {
 }
 
 async function vRepoDetail(root, id, params, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Repository");
   setNav("repos");
-  const d = await api(`/api/repos/${id}`, { signal });
+  const d = await api(`/api/repos/${id}`, { signal, ws: wsId });
 
   const head = el("div", "panel");
   head.appendChild(el("h2", null, d.repository.name));
   const meta = el("div", null);
-  meta.appendChild(el("span", "mono", d.repository.remote || "local only"));
+  meta.appendChild(el("span", "mono",
+    d.repository.remote || "local only"));
   head.appendChild(meta);
   root.appendChild(head);
 
   const branch = params.get("branch") || "";
-  const tab = params.get("tab") === "checkpoints" ? "checkpoints" : "sessions";
+  const tab = params.get("tab") === "checkpoints"
+    ? "checkpoints" : "sessions";
   const offset = parseInt(params.get("offset") || "0", 10) || 0;
   const limit = 50;
 
@@ -396,8 +557,10 @@ async function vRepoDetail(root, id, params, signal) {
   root.appendChild(filter);
 
   const tabs = el("div", "tabs");
-  const bS = el("button", tab === "sessions" ? "active" : null, "Sessions");
-  const bC = el("button", tab === "checkpoints" ? "active" : null, "Checkpoints");
+  const bS = el("button", tab === "sessions" ? "active" : null,
+    "Sessions");
+  const bC = el("button", tab === "checkpoints" ? "active" : null,
+    "Checkpoints");
   bS.addEventListener("click", () => nav({ tab: "sessions" }));
   bC.addEventListener("click", () => nav({ tab: "checkpoints" }));
   tabs.append(bS, bC);
@@ -408,7 +571,7 @@ async function vRepoDetail(root, id, params, signal) {
                                    offset: String(offset) });
   if (branch) qp.set("branch", branch);
   if (tab === "checkpoints") {
-    const cps = await api(`/api/checkpoints?${qp}`, { signal });
+    const cps = await api(`/api/checkpoints?${qp}`, { signal, ws: wsId });
     if (cps.items.length) {
       panel.appendChild(table(
         ["Commit", "Message", "Branch", "Captured"],
@@ -423,7 +586,7 @@ async function vRepoDetail(root, id, params, signal) {
         (o) => nav({ offset: o })));
     }
   } else {
-    const ss = await api(`/api/sessions?${qp}`, { signal });
+    const ss = await api(`/api/sessions?${qp}`, { signal, ws: wsId });
     if (ss.items.length) {
       panel.appendChild(table(
         ["Session", "Agent", "Status", "Branch", "Updated"],
@@ -443,9 +606,10 @@ async function vRepoDetail(root, id, params, signal) {
 }
 
 async function vSessions(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Sessions");
   setNav("sessions");
-  const repos = await repoOptions(signal);
+  const repos = await repoOptions(signal, wsId);
 
   const agent = params.get("agent") || "";
   const repo = params.get("repo") || "";
@@ -484,8 +648,10 @@ async function vSessions(root, params, signal) {
   };
   aSel.addEventListener("change", apply);
   rSel.addEventListener("change", apply);
-  bIn.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
-  qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+  bIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
   const go = el("button", null, "Filter");
   go.addEventListener("click", apply);
   filters.append(aSel, rSel, bIn, qIn, go);
@@ -498,7 +664,7 @@ async function vSessions(root, params, signal) {
   if (q) qp.set("q", q);
   qp.set("limit", String(limit));
   qp.set("offset", String(offset));
-  const d = await api(`/api/sessions?${qp}`, { signal });
+  const d = await api(`/api/sessions?${qp}`, { signal, ws: wsId });
 
   const p = el("div", "panel");
   if (!d.items.length) {
@@ -530,6 +696,7 @@ const KIND_LABELS = {
 };
 
 async function vSessionDetail(root, id, params, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Session");
   setNav("sessions");
   const kind = params.get("kind") || "";
@@ -538,7 +705,7 @@ async function vSessionDetail(root, id, params, signal) {
   const qp = new URLSearchParams({ limit: String(limit),
                                    offset: String(offset) });
   if (kind) qp.set("kind", kind);
-  const d = await api(`/api/sessions/${id}?${qp}`, { signal });
+  const d = await api(`/api/sessions/${id}?${qp}`, { signal, ws: wsId });
   const s = d.session;
 
   const head = el("div", "panel");
@@ -569,19 +736,22 @@ async function vSessionDetail(root, id, params, signal) {
   const copyH = el("button", null, "Copy handoff");
   copyH.addEventListener("click", async () => {
     try {
-      const res = await fetch(`/api/sessions/${id}/handoff`,
-                              { credentials: "same-origin" });
+      const res = await fetch(`/api/sessions/${id}/handoff`, {
+        credentials: "same-origin",
+        headers: wsHeaders(null, wsId) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
-      copyH.textContent = (await copyText(text)) ? "Copied" : "Copy failed";
+      copyH.textContent =
+        (await copyText(text)) ? "Copied" : "Copy failed";
     } catch (_) {
       copyH.textContent = "Copy failed";
     }
     setTimeout(() => { copyH.textContent = "Copy handoff"; }, 1500);
   });
-  const dlH = el("a", "button", "Download handoff");
-  dlH.href = `/api/sessions/${id}/handoff`;
-  dlH.setAttribute("download", "partial-handoff.md");
+  const dlH = el("button", "button", "Download handoff");
+  dlH.addEventListener("click", () =>
+    fetchBlob(`/api/sessions/${id}/handoff`, "partial-handoff.md",
+      wsId));
   acts.append(copyH, dlH);
   head.appendChild(acts);
   root.appendChild(head);
@@ -672,9 +842,10 @@ async function vSessionDetail(root, id, params, signal) {
 }
 
 async function vCheckpoints(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Checkpoints");
   setNav("checkpoints");
-  const repos = await repoOptions(signal);
+  const repos = await repoOptions(signal, wsId);
   const repo = params.get("repo") || "";
   const branch = params.get("branch") || "";
   const offset = parseInt(params.get("offset") || "0", 10) || 0;
@@ -697,7 +868,8 @@ async function vCheckpoints(root, params, signal) {
     location.hash = `#/checkpoints?${p}`;
   };
   rSel.addEventListener("change", apply);
-  bIn.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+  bIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
   const go = el("button", null, "Filter");
   go.addEventListener("click", apply);
   filters.append(rSel, bIn, go);
@@ -707,7 +879,7 @@ async function vCheckpoints(root, params, signal) {
                                    offset: String(offset) });
   if (repo) qp.set("repo", repo);
   if (branch) qp.set("branch", branch);
-  const d = await api(`/api/checkpoints?${qp}`, { signal });
+  const d = await api(`/api/checkpoints?${qp}`, { signal, ws: wsId });
   const p = el("div", "panel");
   p.appendChild(el("h2", null, "Checkpoints"));
   if (!d.items.length) {
@@ -794,9 +966,12 @@ function renderDiff(diff, files) {
 }
 
 async function vCheckpointDetail(root, id, params, signal) {
+  const wsId = currentWs && currentWs.id;
+  const wsCanWrite = !demoMode() && currentWs
+    && ROLE_RANK[currentWs.role] >= ROLE_RANK.member;
   setCrumb("Checkpoint");
   setNav("checkpoints");
-  const d = await api(`/api/checkpoints/${id}`, { signal });
+  const d = await api(`/api/checkpoints/${id}`, { signal, ws: wsId });
   const c = d.checkpoint;
 
   const head = el("div", "panel");
@@ -819,8 +994,10 @@ async function vCheckpointDetail(root, id, params, signal) {
                  `Changes (${(c.files || []).length})`);
   const bSe = el("button", tab === "sessions" ? "active" : null,
                  `Sessions (${d.sessions.length})`);
-  bCh.addEventListener("click", () => { location.hash = `#/checkpoints/${id}?tab=changes`; });
-  bSe.addEventListener("click", () => { location.hash = `#/checkpoints/${id}?tab=sessions`; });
+  bCh.addEventListener("click", () => {
+    location.hash = `#/checkpoints/${id}?tab=changes`; });
+  bSe.addEventListener("click", () => {
+    location.hash = `#/checkpoints/${id}?tab=sessions`; });
   tabs.append(bCh, bSe);
   root.appendChild(tabs);
 
@@ -830,7 +1007,8 @@ async function vCheckpointDetail(root, id, params, signal) {
       p.appendChild(table(
         ["Session", "Agent", "Status", "Link"],
         d.sessions.map((s) => {
-          const link = (c.links || []).find((l) => l.session_id === s.id);
+          const link = (c.links || []).find(
+            (l) => l.session_id === s.id);
           return [sessionLink(s), agentPill(s.agent),
                   statusPill(s.status), link ? link.method : "—"];
         })));
@@ -849,7 +1027,8 @@ async function vCheckpointDetail(root, id, params, signal) {
   const rev = el("div", "panel");
   rev.appendChild(el("h3", null, "Review notes"));
   const list = el("div");
-  const reviews = await api(`/api/checkpoints/${id}/reviews`, { signal });
+  const reviews = await api(`/api/checkpoints/${id}/reviews`,
+    { signal, ws: wsId });
   if (!reviews.items.length) {
     list.appendChild(el("div", null, "No notes yet."));
   }
@@ -862,55 +1041,60 @@ async function vCheckpointDetail(root, id, params, signal) {
   }
   rev.appendChild(list);
 
-  const form = el("div");
-  form.className = "mt12";
-  const nameIn = el("input");
-  nameIn.placeholder = "Your name";
-  nameIn.setAttribute("aria-label", "Reviewer name");
-  nameIn.maxLength = 80;
-  nameIn.disabled = demoMode();
-  const bodyIn = document.createElement("textarea");
-  bodyIn.placeholder = demoMode()
-    ? "Notes are disabled in the demo workspace"
-    : "Add a review note…";
-  bodyIn.setAttribute("aria-label", "Review note");
-  bodyIn.maxLength = 10000;
-  bodyIn.disabled = demoMode();
-  bodyIn.className = "review-input";
-  const status = el("div");
-  status.setAttribute("aria-live", "polite");
-  const save = el("button", "primary", "Add note");
-  save.disabled = demoMode();
-  save.addEventListener("click", async () => {
-    status.textContent = "";
-    try {
-      const res = await fetch(`/api/checkpoints/${id}/reviews`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          author: nameIn.value, body: bodyIn.value }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
-      status.className = "notice-ok";
-      status.textContent = "Note saved.";
-      bodyIn.value = "";
-      const r = data.item;
-      if (list.firstChild && list.firstChild.textContent === "No notes yet.")
-        list.textContent = "";
-      const rv = el("div", "review");
-      rv.appendChild(el("div", "who",
-        `${r.author} · ${fmtDate(r.created_at)}`));
-      rv.appendChild(el("div", "what", r.body));
-      list.appendChild(rv);
-    } catch (err) {
-      status.className = "notice-err";
-      status.textContent = err.message || "Save failed";
-    }
-  });
-  form.append(nameIn, bodyIn, save, status);
-  rev.appendChild(form);
+  if (wsCanWrite) {
+    const form = el("div");
+    form.className = "mt12";
+    const who = el("div", "hint",
+      `Posting as ${me.user ? me.user.name : "you"}`);
+    const bodyIn = document.createElement("textarea");
+    bodyIn.placeholder = "Add a review note…";
+    bodyIn.setAttribute("aria-label", "Review note");
+    bodyIn.maxLength = 10000;
+    bodyIn.className = "review-input";
+    const status = el("div");
+    status.setAttribute("aria-live", "polite");
+    const save = el("button", "primary", "Add note");
+    save.addEventListener("click", async () => {
+      status.textContent = "";
+      save.disabled = true;
+      try {
+        const res = await fetch(`/api/checkpoints/${id}/reviews`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: wsHeaders(
+            { "Content-Type": "application/json" }, wsId),
+          body: JSON.stringify({ body: bodyIn.value }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        status.className = "notice-ok";
+        status.textContent = "Note saved.";
+        bodyIn.value = "";
+        const r = data.item;
+        if (list.firstChild
+            && list.firstChild.textContent === "No notes yet.") {
+          list.textContent = "";
+        }
+        const rv = el("div", "review");
+        rv.appendChild(el("div", "who",
+          `${r.author} · ${fmtDate(r.created_at)}`));
+        rv.appendChild(el("div", "what", r.body));
+        list.appendChild(rv);
+      } catch (err) {
+        status.className = "notice-err";
+        status.textContent = err.message || "Save failed";
+      } finally {
+        save.disabled = false;
+      }
+    });
+    form.append(who, bodyIn, save, status);
+    rev.appendChild(form);
+  } else if (!demoMode()) {
+    rev.appendChild(el("p", "hint",
+      "Your role is read-only in this workspace."));
+  }
   const local = el("p", null,
     "Review notes are stored locally and are not synced with Git" +
     " checkpoint metadata yet.");
@@ -920,12 +1104,13 @@ async function vCheckpointDetail(root, id, params, signal) {
 }
 
 async function vSearch(root, params, signal) {
+  const wsId = currentWs && currentWs.id;
   setCrumb("Search");
   setNav("search");
   const q = params.get("q") || "";
   const offset = parseInt(params.get("offset") || "0", 10) || 0;
   const limit = 50;
-  const repos = await repoOptions(signal);
+  const repos = await repoOptions(signal, wsId);
 
   const filters = el("div", "filters");
   const qIn = el("input");
@@ -953,7 +1138,8 @@ async function vSearch(root, params, signal) {
     location.hash = `#/search?${p}`;
   };
   go.addEventListener("click", apply);
-  qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+  qIn.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") apply(); });
   filters.append(qIn, rSel, aSel, go);
   root.appendChild(filters);
 
@@ -966,7 +1152,7 @@ async function vSearch(root, params, signal) {
                                    offset: String(offset) });
   if (rSel.value) qp.set("repo", rSel.value);
   if (aSel.value) qp.set("agent", aSel.value);
-  const d = await api(`/api/search?${qp}`, { signal });
+  const d = await api(`/api/search?${qp}`, { signal, ws: wsId });
   const p = el("div", "panel");
   if (!d.items.length) {
     p.appendChild(el("div", "empty", `No results for "${q}".`));
@@ -997,9 +1183,12 @@ async function vSearch(root, params, signal) {
 }
 
 async function vIntegrations(root, signal) {
+  const wsId = currentWs && currentWs.id;
+  const wsCanWrite = !demoMode() && currentWs
+    && ROLE_RANK[currentWs.role] >= ROLE_RANK.member;
   setCrumb("Integrations");
   setNav("integrations");
-  const d = await api("/api/integrations", { signal });
+  const d = await api("/api/integrations", { signal, ws: wsId });
 
   const intro = el("div", "panel");
   intro.appendChild(el("h2", null, "Connect an agent"));
@@ -1008,10 +1197,10 @@ async function vIntegrations(root, signal) {
     " hooks or records explicit imports — nothing is connected until" +
     " you run the setup commands in your project."));
   for (const cmd of [
-    "python3 -m pip install .",
+    "uv pip install --python .venv/bin/python -e .",
     "partial enable --agent all",
     "partial serve",
-    "partial auth token",
+    "partial account create --email you@example.com --name You",
   ]) {
     const row = el("div", "cmdline");
     row.appendChild(el("code", null, cmd));
@@ -1044,16 +1233,19 @@ async function vIntegrations(root, signal) {
   file.type = "file";
   file.accept = "application/json,.json";
   file.setAttribute("aria-label", "Bundle file");
-  file.disabled = demoMode();
+  file.disabled = !wsCanWrite;
   const upBtn = el("button", null, "Upload bundle");
-  upBtn.disabled = demoMode();
+  upBtn.disabled = !wsCanWrite;
   const upStatus = el("div");
   upStatus.setAttribute("aria-live", "polite");
   upBtn.addEventListener("click", async () => {
     upStatus.textContent = "";
+    upBtn.disabled = true;
+    try {
     const f = file.files && file.files[0];
     if (!f) { upStatus.className = "notice-err";
-              upStatus.textContent = "Choose a bundle file first."; return; }
+              upStatus.textContent = "Choose a bundle file first.";
+              return; }
     if (f.size > 16 * 1024 * 1024) {
       upStatus.className = "notice-err";
       upStatus.textContent = "Bundle exceeds 16 MiB.";
@@ -1068,15 +1260,23 @@ async function vIntegrations(root, signal) {
       upStatus.textContent = "Not a valid JSON bundle.";
       return;
     }
+    if (wsId !== (currentWs && currentWs.id)) {
+      upStatus.className = "notice-err";
+      upStatus.textContent = "Workspace changed — upload aborted.";
+      return;
+    }
     try {
       const res = await fetch("/api/bundles", {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
+        headers: wsHeaders(
+          { "Content-Type": "application/json" }, wsId),
         body: text,
       });
       const data = await res.json().catch(() => null);
-      if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+      if (!res.ok) {
+        throw new Error((data && data.error) || `HTTP ${res.status}`);
+      }
       upStatus.className = "notice-ok";
       upStatus.textContent = "Bundle imported.";
       file.value = "";
@@ -1084,6 +1284,9 @@ async function vIntegrations(root, signal) {
     } catch (err) {
       upStatus.className = "notice-err";
       upStatus.textContent = err.message || "Upload failed";
+    }
+    } finally {
+      upBtn.disabled = !wsCanWrite;
     }
   });
   up.append(file, upBtn);
@@ -1095,12 +1298,402 @@ async function vIntegrations(root, signal) {
   warn.className = "hint small";
   tools.appendChild(warn);
   const exp = el("div", "filters");
-  const expA = el("a", "button", "Download export bundle");
-  expA.href = "/api/export";
-  expA.setAttribute("download", "partial-export.json");
-  exp.appendChild(expA);
+  const expB = el("button", "button", "Download export bundle");
+  expB.addEventListener("click", () =>
+    fetchBlob("/api/export", "partial-export.json", wsId));
+  exp.appendChild(expB);
   tools.appendChild(exp);
   root.appendChild(tools);
+}
+
+async function vSettings(root, signal) {
+  const wsId = currentWs && currentWs.id;
+  const wsRole = currentWs ? currentWs.role : "viewer";
+  setCrumb("Settings");
+  setNav("settings");
+
+  const head = el("div", "panel");
+  head.appendChild(el("h2", null, "Settings"));
+  head.appendChild(el("p", null,
+    `Signed in as ${me.user.name} · workspace` +
+    ` ${currentWs ? currentWs.name : ""}` +
+    ` · role ${currentWs ? currentWs.role : "—"}`));
+  root.appendChild(head);
+
+  if (!demoMode()) {
+    const nw = el("div", "panel");
+    nw.appendChild(el("h3", null, "New workspace"));
+    const nwName = el("input");
+    nwName.placeholder = "Workspace name";
+    nwName.setAttribute("aria-label", "Workspace name");
+    const nwBtn = el("button", null, "Create workspace");
+    const nwStatus = el("div");
+    nwStatus.setAttribute("aria-live", "polite");
+    nwBtn.addEventListener("click", async () => {
+      nwStatus.textContent = "";
+      nwBtn.disabled = true;
+      try {
+        const res = await fetch("/api/workspaces", {
+          method: "POST", credentials: "same-origin",
+          headers: wsHeaders(
+            { "Content-Type": "application/json" }, wsId),
+          body: JSON.stringify({ name: nwName.value.trim() }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        me = await api("/api/me", {
+          headers: wsHeaders(null, wsId) });
+        pickWorkspace();
+        renderWsSelect();
+        nwStatus.className = "notice-ok";
+        nwStatus.textContent = "Workspace created.";
+        nwName.value = "";
+      } catch (err) {
+        nwStatus.className = "notice-err";
+        nwStatus.textContent = err.message || "Create failed";
+      } finally {
+        nwBtn.disabled = false;
+      }
+    });
+    nw.append(nwName, nwBtn, nwStatus);
+    root.appendChild(nw);
+
+    const aj = el("div", "panel");
+    aj.appendChild(el("h3", null, "Accept invitation"));
+    aj.appendChild(el("p", "hint small",
+      "Paste an invitation token to join another workspace" +
+      ` as ${me.user.email}.`));
+    const ajRow = el("div", "filters");
+    const ajTok = el("input");
+    ajTok.placeholder = "Invitation token";
+    ajTok.setAttribute("aria-label", "Invitation token");
+    const ajBtn = el("button", null, "Accept invitation");
+    ajRow.append(ajTok, ajBtn);
+    aj.appendChild(ajRow);
+    const ajStatus = el("div");
+    ajStatus.setAttribute("aria-live", "polite");
+    aj.appendChild(ajStatus);
+    ajBtn.addEventListener("click", async () => {
+      ajStatus.textContent = "";
+      ajBtn.disabled = true;
+      const tok = ajTok.value;
+      ajTok.value = "";
+      try {
+        const res = await fetch("/api/invites/accept", {
+          method: "POST", credentials: "same-origin",
+          headers: wsHeaders(
+            { "Content-Type": "application/json" }, wsId),
+          body: JSON.stringify({ token: tok, email: me.user.email }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        me = await api("/api/me", {
+          headers: wsHeaders(null, wsId) });
+        pickWorkspace();
+        renderWsSelect();
+        ajStatus.className = "notice-ok";
+        ajStatus.textContent =
+          "Invitation accepted — select the workspace above.";
+      } catch (err) {
+        ajStatus.className = "notice-err";
+        ajStatus.textContent = err.message || "Accept failed";
+      } finally {
+        ajBtn.disabled = false;
+      }
+    });
+    root.appendChild(aj);
+
+    const mp = el("div", "panel");
+    mp.appendChild(el("h3", null, "Members"));
+    const members = await api(
+      `/api/workspaces/${wsId}/members`, { signal, ws: wsId });
+    const myRole = wsRole;
+    const mrows = members.items.map((m) => {
+      const cells = [m.name, el("span", "mono", m.email), m.role];
+      const ops = el("span");
+      const manageable = ROLE_RANK[myRole] >= ROLE_RANK.admin
+        && m.user_id !== me.user.id
+        && (myRole === "owner"
+            || ROLE_RANK[m.role] < ROLE_RANK[myRole]);
+      if (manageable) {
+        const sel = el("select");
+        sel.setAttribute("aria-label", `Role for ${m.email}`);
+        const allowed = myRole === "owner"
+          ? ["owner", "admin", "member", "viewer"]
+          : ["member", "viewer"];
+        for (const r of allowed) sel.appendChild(new Option(r, r));
+        sel.value = allowed.includes(m.role) ? m.role : "viewer";
+        sel.addEventListener("change", async () => {
+          sel.disabled = true;
+          try {
+            const res = await fetch(
+              `/api/workspaces/${wsId}/members/${m.user_id}`, {
+                method: "PATCH", credentials: "same-origin",
+                headers: wsHeaders(
+                  { "Content-Type": "application/json" }, wsId),
+                body: JSON.stringify({ role: sel.value }),
+              });
+            if (!res.ok) {
+              const d = await res.json().catch(() => null);
+              throw new Error((d && d.error) || `HTTP ${res.status}`);
+            }
+            route();
+          } catch (err) {
+            sel.disabled = false;
+            showErr(err.message);
+          }
+        });
+        const rm = el("button", "ghost", "Remove");
+        rm.addEventListener("click", async () => {
+          if (!window.confirm(
+            `Remove ${m.email} from this workspace?`)) return;
+          rm.disabled = true;
+          try {
+            const res = await fetch(
+              `/api/workspaces/${wsId}/members/${m.user_id}`, {
+                method: "DELETE", credentials: "same-origin",
+                headers: wsHeaders(
+                  { "Content-Type": "application/json" }, wsId),
+                body: "{}",
+              });
+            if (!res.ok) {
+              const d = await res.json().catch(() => null);
+              throw new Error((d && d.error) || `HTTP ${res.status}`);
+            }
+            route();
+          } catch (err) {
+            rm.disabled = false;
+            showErr(err.message);
+          }
+        });
+        ops.append(sel, rm);
+      }
+      cells.push(ops);
+      return cells;
+    });
+    mp.appendChild(table(["Name", "Email", "Role", ""], mrows));
+    root.appendChild(mp);
+
+    if (ROLE_RANK[myRole] >= ROLE_RANK.admin) {
+      const ip = el("div", "panel");
+      ip.appendChild(el("h3", null, "Invite a member"));
+      const iRow = el("div", "filters");
+      const iEmail = el("input");
+      iEmail.type = "email";
+      iEmail.placeholder = "email@example.com";
+      iEmail.setAttribute("aria-label", "Invitee email");
+      const iRole = el("select");
+      iRole.setAttribute("aria-label", "Invite role");
+      const roles = myRole === "owner"
+        ? ["member", "viewer", "admin", "owner"]
+        : ["member", "viewer"];
+      for (const r of roles) iRole.appendChild(new Option(r, r));
+      const iBtn = el("button", "primary", "Create invitation");
+      iRow.append(iEmail, iRole, iBtn);
+      ip.appendChild(iRow);
+      const iStatus = el("div");
+      iStatus.setAttribute("aria-live", "polite");
+      const iTokenBox = el("div");
+      iBtn.addEventListener("click", async () => {
+        iStatus.textContent = ""; iTokenBox.textContent = "";
+        iBtn.disabled = true;
+        try {
+          const res = await fetch(
+            `/api/workspaces/${wsId}/invites`, {
+              method: "POST", credentials: "same-origin",
+              headers: wsHeaders(
+                { "Content-Type": "application/json" }, wsId),
+              body: JSON.stringify({
+                email: iEmail.value.trim(), role: iRole.value }),
+            });
+          const data = await res.json().catch(() => null);
+          if (!res.ok) {
+            throw new Error((data && data.error) || `HTTP ${res.status}`);
+          }
+          iStatus.className = "notice-ok";
+          iStatus.textContent =
+            "Invitation created — share this token once:";
+          const tb = el("div", "cmdline");
+          tb.appendChild(el("code", null, data.item.token));
+          tb.appendChild(copyBtn(data.item.token));
+          iTokenBox.appendChild(tb);
+          iEmail.value = "";
+        } catch (err) {
+          iStatus.className = "notice-err";
+          iStatus.textContent = err.message || "Invite failed";
+        } finally {
+          iBtn.disabled = false;
+        }
+      });
+      ip.append(iStatus, iTokenBox);
+      root.appendChild(ip);
+    }
+
+    const tp = el("div", "panel");
+    tp.appendChild(el("h3", null, "API tokens"));
+    const tRow = el("div", "filters");
+    const tName = el("input");
+    tName.placeholder = "Token name";
+    tName.setAttribute("aria-label", "Token name");
+    const tRole = el("select");
+    tRole.setAttribute("aria-label", "Token role");
+    for (const r of ["member", "viewer"]) {
+      if (ROLE_RANK[r] <= ROLE_RANK[myRole]) {
+        tRole.appendChild(new Option(r, r));
+      }
+    }
+    tRole.value = ROLE_RANK[myRole] >= ROLE_RANK.member
+      ? "member" : "viewer";
+    const tBtn = el("button", "primary", "Create token");
+    tRow.append(tName, tRole, tBtn);
+    tp.appendChild(tRow);
+    const tStatus = el("div");
+    tStatus.setAttribute("aria-live", "polite");
+    const tBox = el("div");
+    tBtn.addEventListener("click", async () => {
+      tStatus.textContent = ""; tBox.textContent = "";
+      tBtn.disabled = true;
+      try {
+        const res = await fetch(
+          `/api/workspaces/${wsId}/tokens`, {
+            method: "POST", credentials: "same-origin",
+            headers: wsHeaders(
+              { "Content-Type": "application/json" }, wsId),
+            body: JSON.stringify({
+              name: tName.value.trim() || "token",
+              role: tRole.value }),
+          });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        tStatus.className = "notice-ok";
+        tStatus.textContent =
+          "Token created — copy it now; it is shown only once:";
+        const tb = el("div", "cmdline");
+        tb.appendChild(el("code", null, data.item.token));
+        tb.appendChild(copyBtn(data.item.token));
+        tBox.appendChild(tb);
+        tName.value = "";
+      } catch (err) {
+        tStatus.className = "notice-err";
+        tStatus.textContent = err.message || "Token create failed";
+      } finally {
+        tBtn.disabled = false;
+      }
+    });
+    tp.append(tStatus, tBox);
+    const tokens = await api(
+      `/api/workspaces/${wsId}/tokens`, { signal, ws: wsId });
+    if (tokens.items.length) {
+      tp.appendChild(table(
+        ["Name", "Role", "Owner", "Expires", ""],
+        tokens.items.map((t) => {
+          const cells = [
+            t.name, t.role, t.email || "—",
+            fmtDate(t.expires_at ? t.expires_at * 1000 : null)];
+          const ops = el("span");
+          if (ROLE_RANK[myRole] >= ROLE_RANK.admin
+              || t.user_id === me.user.id) {
+            const rb = el("button", "ghost", "Revoke");
+            rb.addEventListener("click", async () => {
+              if (!window.confirm(`Revoke token "${t.name}"?`))
+                return;
+              rb.disabled = true;
+              try {
+                const res = await fetch(`/api/tokens/${t.id}`, {
+                  method: "DELETE", credentials: "same-origin",
+                  headers: wsHeaders(
+                    { "Content-Type": "application/json" }, wsId),
+                  body: "{}",
+                });
+                if (!res.ok) {
+                  const d = await res.json().catch(() => null);
+                  throw new Error(
+                    (d && d.error) || `HTTP ${res.status}`);
+                }
+                route();
+              } catch (err) {
+                rb.disabled = false;
+                showErr(err.message);
+              }
+            });
+            ops.appendChild(rb);
+          }
+          cells.push(ops);
+          return cells;
+        })));
+    } else {
+      tp.appendChild(el("div", "empty", "No API tokens yet."));
+    }
+    root.appendChild(tp);
+
+    if (ROLE_RANK[myRole] >= ROLE_RANK.admin) {
+      const ap = el("div", "panel");
+      ap.appendChild(el("h3", null, "Audit log"));
+      const audit = await api(
+        `/api/workspaces/${wsId}/audit`, { signal, ws: wsId });
+      if (audit.items.length) {
+        ap.appendChild(table(
+          ["Time", "Actor", "Action", "Target"],
+          audit.items.map((a) => [
+            fmtDate(a.created_at),
+            el("span", "mono", (a.actor_id || "").slice(0, 12)),
+            a.action,
+            el("span", "mono", (a.target_id || "").slice(0, 12)),
+          ])));
+      } else {
+        ap.appendChild(el("div", "empty", "No audit events yet."));
+      }
+      root.appendChild(ap);
+    }
+
+    const pp = el("div", "panel");
+    pp.appendChild(el("h3", null, "Change password"));
+    const pCur = el("input");
+    pCur.type = "password";
+    pCur.autocomplete = "current-password";
+    pCur.placeholder = "Current password";
+    pCur.setAttribute("aria-label", "Current password");
+    const pNew = el("input");
+    pNew.type = "password";
+    pNew.autocomplete = "new-password";
+    pNew.placeholder = "New password (12+ chars)";
+    pNew.setAttribute("aria-label", "New password");
+    const pBtn = el("button", null, "Change password");
+    const pStatus = el("div");
+    pStatus.setAttribute("aria-live", "polite");
+    pBtn.addEventListener("click", async () => {
+      pStatus.textContent = "";
+      pBtn.disabled = true;
+      try {
+        const res = await fetch("/api/account/password", {
+          method: "POST", credentials: "same-origin",
+          headers: wsHeaders(
+            { "Content-Type": "application/json" }, wsId),
+          body: JSON.stringify({
+            current_password: pCur.value, new_password: pNew.value }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error) || `HTTP ${res.status}`);
+        }
+        showLogin("signin");
+      } catch (err) {
+        pStatus.className = "notice-err";
+        pStatus.textContent = err.message || "Password change failed";
+      } finally {
+        pBtn.disabled = false;
+        pCur.value = ""; pNew.value = "";
+      }
+    });
+    pp.append(pCur, pNew, pBtn, pStatus);
+    root.appendChild(pp);
+  }
 }
 
 async function route() {
@@ -1129,6 +1722,7 @@ async function route() {
       await vCheckpoints(root, params, signal);
     else if (page === "search") await vSearch(root, params, signal);
     else if (page === "integrations") await vIntegrations(root, signal);
+    else if (page === "settings") await vSettings(root, signal);
     else await vOverview(root, signal);
   } catch (err) {
     if (err.name === "AbortError" || !current()) return;
@@ -1146,15 +1740,26 @@ async function route() {
 
 async function boot() {
   try {
+    authStatus = await api("/api/auth/status");
+  } catch (_) {
+    authStatus = null;
+  }
+  try {
     me = await api("/api/me");
   } catch (_) {
     me = null;
-    showLogin();
+    showLogin(authStatus && !authStatus.initialized
+      ? "setup" : "signin");
     return;
   }
+  pickWorkspace();
   showApp();
   demoBanner.hidden = !me.demo;
   logoutBtn.hidden = !!me.demo;
+  renderWsSelect();
+  document.getElementById("user-label").textContent = me.demo
+    ? "Demo workspace"
+    : `${me.user.name} · ${currentWs ? currentWs.role : ""}`;
   document.getElementById("sys-status").textContent =
     `v${me.version}${me.demo ? " · demo" : ""}`;
   if (!location.hash) location.hash = "#/overview";

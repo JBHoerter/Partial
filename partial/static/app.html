@@ -11,15 +11,50 @@
 <div id="login" class="login-wrap" hidden>
   <div class="login-panel">
     <h1>Partial</h1>
-    <div class="sub">Sign in to this workspace</div>
+    <div class="sub" id="login-sub">Sign in to this workspace</div>
     <form id="login-form">
-      <input id="login-token" type="password" autocomplete="off"
-             placeholder="Access token" aria-label="Access token">
+      <input id="login-email" type="email" autocomplete="username"
+             placeholder="Email" aria-label="Email" required>
+      <input id="login-password" type="password"
+             autocomplete="current-password" placeholder="Password"
+             aria-label="Password" required>
       <button class="primary" type="submit">Sign in</button>
     </form>
+    <form id="setup-form" hidden>
+      <input id="setup-email" type="email" autocomplete="username"
+             placeholder="Email" aria-label="Email" required>
+      <input id="setup-name" type="text" autocomplete="name"
+             placeholder="Display name" aria-label="Display name"
+             required>
+      <input id="setup-password" type="password"
+             autocomplete="new-password" placeholder="Password"
+             aria-label="Password" required>
+      <input id="setup-bootstrap" type="password" autocomplete="off"
+             placeholder="Bootstrap token" aria-label="Bootstrap token"
+             required>
+      <button class="primary" type="submit">Create workspace</button>
+    </form>
+    <form id="invite-form" hidden>
+      <input id="invite-token" type="text" autocomplete="off"
+             placeholder="Invitation token" aria-label="Invitation token"
+             required>
+      <input id="invite-email" type="email" autocomplete="username"
+             placeholder="Invited email" aria-label="Invited email"
+             required>
+      <input id="invite-name" type="text" autocomplete="name"
+             placeholder="Display name" aria-label="Display name"
+             required>
+      <input id="invite-password" type="password"
+             autocomplete="new-password" placeholder="Password"
+             aria-label="Password" required>
+      <button class="primary" type="submit">Accept invitation</button>
+    </form>
     <div id="login-error" class="notice-err" role="alert"></div>
-    <div class="hint">Get a token with <code>partial auth token</code>
-      on the machine running this server.</div>
+    <div class="hint" id="login-hint">Run
+      <code>partial auth token</code> on the server machine to get the
+      bootstrap token, or paste an invitation token.</div>
+    <button id="invite-toggle" class="ghost" type="button">Have an
+      invitation token?</button>
   </div>
 </div>
 
@@ -32,6 +67,9 @@
       </div>
       <div class="tagline">Context, committed.</div>
     </div>
+    <div class="ws-switch">
+      <select id="ws-select" aria-label="Workspace"></select>
+    </div>
     <nav class="nav" id="nav">
       <a href="#/overview" data-nav="overview">Overview</a>
       <a href="#/repos" data-nav="repos">Repositories</a>
@@ -39,9 +77,10 @@
       <a href="#/checkpoints" data-nav="checkpoints">Checkpoints</a>
       <a href="#/search" data-nav="search">Search</a>
       <a href="#/integrations" data-nav="integrations">Integrations</a>
+      <a href="#/settings" data-nav="settings">Settings</a>
     </nav>
     <div class="foot">
-      <span>Local workspace</span>
+      <span id="user-label">Workspace</span>
       <span id="sys-status"></span>
       <button id="logout-btn" class="ghost">Sign out</button>
     </div>

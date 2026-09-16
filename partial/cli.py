@@ -669,8 +669,27 @@ def build_parser() -> argparse.ArgumentParser:
     au = sub.add_parser("auth", help="authentication helpers")
     ausub = au.add_subparsers(dest="auth_command")
     at = ausub.add_parser(
-        "token", help="print the workspace access token")
+        "token", help="print the bootstrap token for first-time setup")
     at.set_defaults(func=_cmd_auth_token)
+
+    ac = sub.add_parser("account", help="local account administration")
+    acsub = ac.add_subparsers(dest="account_command")
+    acc = acsub.add_parser(
+        "create", help="create the first owner account (local only)")
+    acc.add_argument("--email", required=True)
+    acc.add_argument("--name", required=True)
+    acc.add_argument("--password-stdin", action="store_true")
+    acc.set_defaults(func=_cmd_account_create)
+    act = acsub.add_parser(
+        "token", help="mint a workspace API token (verifies password)")
+    act.add_argument("--email", required=True)
+    act.add_argument("--workspace", required=True)
+    act.add_argument("--name", required=True)
+    act.add_argument("--role", default="member",
+                     choices=["member", "viewer"])
+    act.add_argument("--expires-days", type=int, default=90)
+    act.add_argument("--password-stdin", action="store_true")
+    act.set_defaults(func=_cmd_account_token)
 
     sv = sub.add_parser("serve", help="run the local web workspace")
     sv.add_argument("--host", default="127.0.0.1")
@@ -683,6 +702,8 @@ def build_parser() -> argparse.ArgumentParser:
         "upload", help="upload an exported bundle to a partial server")
     up.add_argument("server_url")
     up.add_argument("--repo-only", action="store_true")
+    up.add_argument("--workspace", default=None,
+                    help="workspace id for multi-workspace servers")
     up.set_defaults(func=_cmd_upload)
 
     ib = sub.add_parser(
@@ -702,8 +723,83 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_auth_token(args) -> int:
+    from .accounts import Accounts
     from .auth import get_token
-    print(get_token(_home_dir(args)))
+    home = _home_dir(args)
+    acc = Accounts(home, home / "partial.db")
+    if acc.initialized():
+        _warn("accounts are already initialized; the bootstrap token"
+              " no longer grants access — create a workspace API"
+              " token in the web UI (Settings → API tokens)")
+        return 2
+    print(get_token(home))
+    return 0
+
+
+def _read_password_arg(args, prompt="Password: ") -> str | None:
+    if getattr(args, "password_stdin", False):
+        line = sys.stdin.readline(1026)
+        if not line:
+            return None
+        return line.rstrip("\r\n")
+    import getpass
+    first = getpass.getpass(prompt)
+    second = getpass.getpass("Repeat password: ")
+    if first != second:
+        return None
+    return first
+
+
+def _cmd_account_create(args) -> int:
+    from .accounts import Accounts, AccountsError
+    home = _home_dir(args)
+    acc = Accounts(home, home / "partial.db")
+    if acc.initialized():
+        _warn("accounts are already initialized; ask a workspace owner"
+              " or admin for an invitation")
+        return 2
+    password = _read_password_arg(args)
+    if password is None:
+        _warn("passwords did not match" if not args.password_stdin
+              else "no password on stdin")
+        return 2
+    try:
+        user = acc.setup(
+            email=args.email, name=args.name, password=password)
+    except AccountsError as exc:
+        _warn(str(exc))
+        return 2
+    print(f"created owner account {user['email']}"
+          f" ({user['id']}) for the default workspace")
+    return 0
+
+
+def _cmd_account_token(args) -> int:
+    from .accounts import Accounts, AccountsError
+    home = _home_dir(args)
+    acc = Accounts(home, home / "partial.db")
+    if not acc.initialized():
+        _warn("no accounts yet; run `partial account create` first")
+        return 2
+    if args.password_stdin:
+        line = sys.stdin.readline(1026)
+        password = line.rstrip("\r\n") if line else None
+    else:
+        import getpass
+        password = getpass.getpass("Password: ")
+    if password is None:
+        _warn("no password on stdin")
+        return 2
+    try:
+        principal = acc.check_password(args.email, password)
+        item = acc.create_api_token(
+            principal, args.workspace, args.name, args.role,
+            args.expires_days)
+    except AccountsError as exc:
+        _warn(str(exc))
+        return 2
+    print(item["token"])
+    _warn("token shown once; store it securely")
     return 0
 
 
@@ -770,13 +866,16 @@ def _cmd_upload(args) -> int:
         _warn("bundle exceeds the 16 MiB upload limit; retry with"
               " --repo-only to upload a single repository")
         return 2
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if args.workspace:
+        headers["X-Partial-Workspace"] = args.workspace
     req = urllib.request.Request(
         base + "/api/bundles",
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
+        headers=headers,
         method="POST",
     )
     opener = urllib.request.build_opener(_NoRedirect())

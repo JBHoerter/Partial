@@ -348,6 +348,12 @@ class Store:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(reviews)")}
+            if "user_id" not in cols:
+                conn.execute(
+                    "ALTER TABLE reviews ADD COLUMN user_id TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -690,7 +696,8 @@ class Store:
             conn.close()
 
     def add_review(
-        self, checkpoint_id: str, author: str, body: str
+        self, checkpoint_id: str, author: str, body: str,
+        actor: str | None = None,
     ) -> dict:
         if self.get_checkpoint(checkpoint_id) is None:
             raise KeyError(checkpoint_id)
@@ -703,8 +710,8 @@ class Store:
         try:
             conn.execute(
                 "INSERT INTO reviews(id,checkpoint_id,author,body,"
-                "created_at) VALUES(?,?,?,?,?)",
-                (rid, checkpoint_id, author, body, now_iso()),
+                "created_at,user_id) VALUES(?,?,?,?,?,?)",
+                (rid, checkpoint_id, author, body, now_iso(), actor),
             )
             conn.commit()
             return self._review_dict(rid)

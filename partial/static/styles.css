@@ -384,6 +384,9 @@ details.diff-file > pre.diff { border-radius: 0 0 10px 10px; margin: 0; }
 }
 .login-panel h1 { margin: 0 0 4px; font-size: 1.3rem; }
 .login-panel .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 18px; }
+.ws-switch { padding: 0 16px 10px; }
+.ws-switch select { width: 100%; }
+
 .login-panel input { width: 100%; margin-bottom: 12px; }
 .login-panel button { width: 100%; }
 .login-panel .hint { color: var(--muted); font-size: 0.78rem; margin-top: 14px; }

@@ -17,6 +17,7 @@ from partial.server import ApiError, _Context, create_server
 from partial.store import Store
 
 TOKEN = "test-token-" + "x" * 40
+PASSWORD = "correct horse battery"
 
 
 class ServerCase(RepoTestCase):
@@ -66,6 +67,30 @@ class ServerCase(RepoTestCase):
             target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.origin = f"http://127.0.0.1:{self.port}"
+        if not self.demo:
+            self._bootstrap()
+
+    def _bootstrap(self):
+        status, data, _, hdrs = self.req(
+            "POST", "/api/setup",
+            {"email": "owner@example.test", "name": "Owner",
+             "password": PASSWORD, "bootstrap_token": TOKEN},
+            {"Origin": self.origin})
+        self.assertEqual(status, 200, data)
+        cookie = dict(
+            (k.lower(), v) for k, v in hdrs).get("set-cookie")
+        self.owner_cookie = cookie.split(";")[0]
+        status, me, _, _ = self.req(
+            "GET", "/api/me",
+            headers={"Cookie": self.owner_cookie})
+        self.assertEqual(status, 200, me)
+        self.ws_id = me["workspace"]["id"]
+        status, data, _, _ = self.req(
+            "POST", f"/api/workspaces/{self.ws_id}/tokens",
+            {"name": "ci", "role": "member"},
+            {"Origin": self.origin, "Cookie": self.owner_cookie})
+        self.assertEqual(status, 201, data)
+        self.api_token = data["item"]["token"]
 
     def tearDown(self):
         self.server.shutdown()
@@ -95,11 +120,12 @@ class ServerCase(RepoTestCase):
         return resp.status, parsed, raw, resp.getheaders()
 
     def bearer(self):
-        return {"Authorization": f"Bearer {TOKEN}"}
+        return {"Authorization": f"Bearer {self.api_token}"}
 
     def login(self):
         status, data, _, hdrs = self.req(
-            "POST", "/api/login", {"token": TOKEN},
+            "POST", "/api/login",
+            {"email": "owner@example.test", "password": PASSWORD},
             {"Origin": self.origin})
         self.assertEqual(status, 200)
         cookie = dict(
@@ -125,9 +151,16 @@ class AuthTests(ServerCase):
         self.assertTrue(data["authenticated"])
         self.assertFalse(data["demo"])
 
+    def test_bootstrap_token_not_a_bearer(self):
+        status, _, _, _ = self.req(
+            "GET", "/api/me",
+            headers={"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(status, 401)
+
     def test_login_cookie_flow_and_logout(self):
         status, _, _, _ = self.req(
-            "POST", "/api/login", {"token": "wrong"},
+            "POST", "/api/login",
+            {"email": "owner@example.test", "password": "wrong"},
             {"Origin": self.origin})
         self.assertEqual(status, 401)
         cookie = self.login()
@@ -145,10 +178,12 @@ class AuthTests(ServerCase):
 
     def test_login_rate_limit(self):
         for _ in range(10):
-            self.req("POST", "/api/login", {"token": "nope"},
+            self.req("POST", "/api/login",
+                     {"email": "x@x.test", "password": "nope-nope"},
                      {"Origin": self.origin})
         status, _, _, _ = self.req(
-            "POST", "/api/login", {"token": TOKEN},
+            "POST", "/api/login",
+            {"email": "x@x.test", "password": "nope-nope"},
             {"Origin": self.origin})
         self.assertEqual(status, 429)
 
@@ -254,6 +289,79 @@ class AuthTests(ServerCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Keep the context", raw)
         status, _, raw, _ = self.req("GET", "/static/app.js")
+        self.assertEqual(status, 200)
+
+    def test_no_origin_mutations_rejected(self):
+        for path, body in (
+            ("/api/login", {"email": "owner@example.test",
+                            "password": PASSWORD}),
+            ("/api/setup", {"email": "x@x.test", "name": "X",
+                            "password": "x" * 12,
+                            "bootstrap_token": TOKEN}),
+            ("/api/invites/accept", {"token": "t"}),
+        ):
+            status, _, _, _ = self.req("POST", path, body)
+            self.assertEqual(status, 403, path)
+        cookie = self.login()
+        status, _, _, _ = self.req(
+            "POST", "/api/logout", {}, {"Cookie": cookie})
+        self.assertEqual(status, 401)
+        status, _, _, _ = self.req(
+            "GET", "/api/me", headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+
+    def test_bearer_no_origin_write_and_invalid_bearer(self):
+        bundle = self.store.export_bundle()
+        status, data, _, _ = self.req(
+            "POST", "/api/bundles", bundle, self.bearer())
+        self.assertEqual(status, 200)
+        status, _, _, _ = self.req(
+            "POST", "/api/bundles", bundle,
+            {"Authorization": "Bearer " + "z" * 40})
+        self.assertEqual(status, 401)
+        status, _, _, _ = self.req(
+            "POST", "/api/bundles", bundle,
+            {"Authorization": "Bearer " + "z" * 600})
+        self.assertEqual(status, 401)
+
+    def test_scoped_token_admin_paths_403(self):
+        status, _, _, _ = self.req(
+            "POST", "/api/invites/accept", {"token": "x"},
+            {"Origin": self.origin, **self.bearer()})
+        self.assertEqual(status, 403)
+        status, data, _, _ = self.req(
+            "POST", f"/api/workspaces/{self.ws_id}/tokens",
+            {"name": "t2", "role": "member"},
+            {"Origin": self.origin, "Cookie": self.owner_cookie})
+        self.assertEqual(status, 201)
+        status, _, _, _ = self.req(
+            "DELETE", f"/api/tokens/{data['item']['id']}", {},
+            self.bearer())
+        self.assertEqual(status, 403)
+
+    def test_login_password_bounds(self):
+        for bad in ({"x": 1}, ["a"], "x" * 2000, 12345):
+            status, _, _, _ = self.req(
+                "POST", "/api/login",
+                {"email": "owner@example.test", "password": bad},
+                {"Origin": self.origin})
+            self.assertEqual(status, 401, bad)
+
+    def test_change_password_type_errors(self):
+        cookie = self.login()
+        for body in (
+            {"current_password": {"x": 1},
+             "new_password": "y" * 12},
+            {"current_password": PASSWORD,
+             "new_password": {"x": 1}},
+            {"current_password": PASSWORD, "new_password": "short"},
+        ):
+            status, _, _, _ = self.req(
+                "POST", "/api/account/password", body,
+                {"Origin": self.origin, "Cookie": cookie})
+            self.assertIn(status, (400, 401), body)
+        status, _, _, _ = self.req(
+            "GET", "/api/me", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
 
     def test_public_bind_guard(self):
@@ -446,7 +554,7 @@ class ApiTests(ServerCase):
             {"author": " Reviewer ", "body": "  looks good  "},
             {"Origin": self.origin, "Cookie": cookie})
         self.assertEqual(status, 201)
-        self.assertEqual(data["item"]["author"], "Reviewer")
+        self.assertEqual(data["item"]["author"], "Owner")
         self.assertEqual(data["item"]["body"], "looks good")
         status, _, _, _ = self.req(
             "POST", f"/api/checkpoints/{self.checkpoint_id}/reviews",
@@ -482,20 +590,6 @@ class ContextBoundsTests(unittest.TestCase):
                 f"ip-{i}": [2000.0] for i in range(4096)}
             self.assertFalse(ctx.check_login_rate("fresh-ip"))
             self.assertTrue(ctx.check_login_rate("ip-0"))
-
-    def test_sessions_bounded(self):
-        ctx = self._ctx()
-        with unittest.mock.patch(
-                "time.monotonic", return_value=5000.0):
-            ctx.sessions = {
-                f"s{i}": 5000.0 + 60 for i in range(4096)}
-            with self.assertRaises(ApiError) as cm:
-                ctx.new_session()
-            self.assertEqual(cm.exception.code, 429)
-            ctx.sessions = {f"s{i}": 1.0 for i in range(4096)}
-            tok = ctx.new_session()
-            self.assertTrue(ctx.session_valid(tok))
-            self.assertEqual(len(ctx.sessions), 1)
 
 
 class DemoTests(RepoTestCase):

@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
+from .accounts import Accounts, AccountsError, Principal
 from .handoff import format_handoff
 from .privacy import redact
 from .store import Store
@@ -22,6 +23,7 @@ SESSION_TTL = 12 * 3600
 LOGIN_LIMIT = 10
 LOGIN_WINDOW = 60
 COOKIE_NAME = "partial_session"
+WS_HEADER = "X-Partial-Workspace"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -84,7 +86,8 @@ class _Context:
         self.store = store
         self.demo = demo
         self.token = token
-        self.sessions: dict[str, float] = {}
+        self.accounts = None if demo else Accounts(
+            store.path.parent, store.path)
         self.login_hits: dict[str, list[float]] = {}
         self.allowed_hosts: set[str] = set()
         self.allowed_origins: set[str] = set()
@@ -118,31 +121,6 @@ class _Context:
                 return False
             hits.append(now)
             return True
-
-    def new_session(self) -> str:
-        now = time.monotonic()
-        with self.lock:
-            self.sessions = {
-                k: v for k, v in self.sessions.items() if v > now}
-            if len(self.sessions) >= 4096:
-                raise ApiError(429, "workspace session limit reached")
-            tok = secrets.token_urlsafe(32)
-            self.sessions[tok] = now + SESSION_TTL
-            return tok
-
-    def session_valid(self, tok: str) -> bool:
-        with self.lock:
-            exp = self.sessions.get(tok)
-            if exp is None:
-                return False
-            if exp < time.monotonic():
-                del self.sessions[tok]
-                return False
-            return True
-
-    def revoke_session(self, tok: str) -> None:
-        with self.lock:
-            self.sessions.pop(tok, None)
 
 
 def _safe_event(e: dict) -> dict:
@@ -178,6 +156,12 @@ def _page(args: dict, default: int, max_limit: int) -> tuple[int, int]:
     if limit < 1 or offset < 0 or offset > 100000:
         raise ApiError(400, "invalid limit/offset")
     return min(limit, max_limit), offset
+
+
+def _obj(body_json) -> dict:
+    if not isinstance(body_json, dict):
+        raise ApiError(400, "expected a JSON object")
+    return body_json
 
 
 class _CtxRef:
@@ -250,14 +234,13 @@ def _make_handler(ctx):
                 return True
             return False
 
-        def _bearer_ok(self) -> bool:
+        def _bearer_raw(self) -> str | None:
             auth = self.headers.get("Authorization") or ""
             if not auth.startswith("Bearer "):
-                return False
-            return secrets.compare_digest(
-                auth[7:].encode(), ctx.token.encode())
+                return None
+            return auth[7:]
 
-        def _cookie_token(self) -> str | None:
+        def _cookie_raw(self) -> str | None:
             raw = self.headers.get("Cookie")
             if not raw:
                 return None
@@ -268,13 +251,19 @@ def _make_handler(ctx):
             morsel = jar.get(COOKIE_NAME)
             return morsel.value if morsel else None
 
-        def _authed(self) -> bool:
+        def _principal(self) -> Principal | None:
             if ctx.demo:
-                return True
-            if self._bearer_ok():
-                return True
-            tok = self._cookie_token()
-            return bool(tok and ctx.session_valid(tok))
+                return Principal(
+                    user_id="demo", email="demo@localhost",
+                    name="Demo", workspace_id="demo",
+                    token_role="owner")
+            raw = self._bearer_raw()
+            if raw is not None:
+                return ctx.accounts.authenticate(raw, api_token=True)
+            ck = self._cookie_raw()
+            if ck:
+                return ctx.accounts.authenticate(ck)
+            return None
 
         def _read_body(self) -> bytes:
             lengths = self.headers.get_all("Content-Length") or []
@@ -302,11 +291,32 @@ def _make_handler(ctx):
                 raise ApiError(400, "invalid JSON body")
             return obj
 
-        def _guard_write(self, browser_origin):
+        def _resolve_ws(self, principal: Principal, *,
+                        write=False, admin=False, owner=False):
             if ctx.demo:
-                raise ApiError(403, "demo workspace is read-only")
-            if not browser_origin and not self._bearer_ok():
+                if write or admin or owner:
+                    raise ApiError(403, "demo workspace is read-only")
+                return ctx.store, {
+                    "id": "demo", "name": "Demo workspace",
+                    "role": "owner"}
+            ws_id = self.headers.get(WS_HEADER)
+            try:
+                return ctx.accounts.workspace_store(
+                    principal, ws_id, write=write, admin=admin,
+                    owner=owner)
+            except AccountsError as exc:
+                raise ApiError(exc.code, str(exc))
+
+        def _guard_write(self, browser_origin, principal):
+            if not browser_origin and principal.token_id is None:
                 raise ApiError(401, "origin required")
+
+        def _cookie(self, raw: str, max_age: int) -> str:
+            c = (f"{COOKIE_NAME}={raw}; HttpOnly; SameSite=Strict;"
+                 f" Path=/; Max-Age={max_age}")
+            if ctx.secure_cookie:
+                c += "; Secure"
+            return c
 
         def _dispatch(self, method):
             try:
@@ -320,20 +330,30 @@ def _make_handler(ctx):
                         return self._serve_static(path)
                     raise ApiError(404, "not found")
                 browser_origin = self._check_origin()
-                if method == "POST":
-                    self._guard_write(browser_origin)
+                if method in ("POST", "PATCH", "DELETE"):
                     body = self._read_body()
-                    return self._post(path, body)
+                    return self._write(
+                        method, path, body, browser_origin)
                 if method not in ("GET", "HEAD"):
                     raise ApiError(404, "not found")
                 if path == "/api/health":
                     return self._json(200, {"ok": True,
                                             "version": __version__})
-                if not self._authed():
+                if path == "/api/auth/status":
+                    return self._json(200, {
+                        "initialized": (
+                            ctx.demo
+                            or ctx.accounts.initialized()),
+                        "registration": "invite",
+                        "demo": ctx.demo})
+                principal = self._principal()
+                if principal is None:
                     raise ApiError(401, "authentication required")
-                return self._get(path, qs)
+                return self._get(path, qs, principal)
             except ApiError as exc:
                 self._error(exc.code, exc.message)
+            except AccountsError as exc:
+                self._error(exc.code, str(exc))
             except (ValueError, KeyError) as exc:
                 code = 404 if isinstance(exc, KeyError) else 400
                 self._error(code, str(exc))
@@ -351,6 +371,9 @@ def _make_handler(ctx):
         def do_POST(self):
             self._dispatch("POST")
 
+        def do_PATCH(self):
+            self._dispatch("PATCH")
+
         def do_PUT(self):
             self._dispatch("PUT")
 
@@ -365,29 +388,56 @@ def _make_handler(ctx):
             body = (STATIC_DIR / name).read_bytes()
             self._send(200, body, ctype=ctype)
 
-        def _get(self, path, qs):
+        def _get(self, path, qs, principal: Principal):
             if path == "/api/me":
-                return self._json(200, {
-                    "authenticated": True, "demo": ctx.demo,
-                    "version": __version__})
+                return self._me(principal)
+            if path == "/api/workspaces" or path.startswith(
+                    "/api/workspaces/"):
+                if ctx.demo:
+                    raise ApiError(
+                        403, "demo workspace is read-only")
+                if principal.token_id is not None:
+                    raise ApiError(
+                        403, "API tokens cannot administer")
+                if path == "/api/workspaces":
+                    return self._json(200, {
+                        "items": ctx.accounts.workspaces(
+                            principal)})
+                m = _match(path, "/api/workspaces/",
+                           suffix="/members")
+                if m:
+                    return self._json(200, {
+                        "items": ctx.accounts.members(principal, m)})
+                m = _match(path, "/api/workspaces/", suffix="/audit")
+                if m:
+                    return self._json(200, {
+                        "items": ctx.accounts.list_audit(
+                            principal, m)})
+                m = _match(path, "/api/workspaces/", suffix="/tokens")
+                if m:
+                    return self._json(200, {
+                        "items": ctx.accounts.list_api_tokens(
+                            principal, m)})
+                raise ApiError(404, "not found")
+            if path == "/api/integrations":
+                self._resolve_ws(principal)
+                return self._json(200, _integrations())
+            store, _ws = self._resolve_ws(principal)
             if path == "/api/overview":
-                s = ctx.store.stats()
+                s = store.stats()
                 return self._json(200, {
                     "repositories": s["repositories"],
                     "sessions": s["sessions"],
                     "checkpoints": s["checkpoints"]})
-            if path == "/api/integrations":
-                return self._json(200, _integrations())
             if path == "/api/repos":
                 items = [{
                     "id": r["id"], "name": r["name"],
-                    "remote": r["remote"],
-                    "created_at": r["created_at"],
-                } for r in ctx.store.list_repos()]
+                    "remote": r["remote"], "created_at": r["created_at"],
+                } for r in store.list_repos()]
                 return self._json(200, {"items": items})
             if path == "/api/sessions":
                 limit, offset = _page(qs, 50, 100)
-                rows = ctx.store.list_sessions(
+                rows = store.list_sessions(
                     repo_id=_qs(qs, "repo"), agent=_qs(qs, "agent"),
                     q=_qs(qs, "q"), branch=_qs(qs, "branch"),
                     limit=limit + 1, offset=offset)
@@ -396,7 +446,7 @@ def _make_handler(ctx):
                     "items": items, "has_more": len(rows) > limit})
             if path == "/api/checkpoints":
                 limit, offset = _page(qs, 50, 100)
-                rows = ctx.store.list_checkpoints(
+                rows = store.list_checkpoints(
                     repo_id=_qs(qs, "repo"), branch=_qs(qs, "branch"),
                     limit=limit + 1, offset=offset)
                 items = [_safe_checkpoint(c, full=False)
@@ -406,7 +456,7 @@ def _make_handler(ctx):
             if path == "/api/search":
                 q = _qs(qs, "q") or ""
                 limit, offset = _page(qs, 50, 100)
-                rows = ctx.store.search_events(
+                rows = store.search_events(
                     q, repo_id=_qs(qs, "repo"), agent=_qs(qs, "agent"),
                     limit=limit + 1, offset=offset)
                 items = []
@@ -418,20 +468,18 @@ def _make_handler(ctx):
                     "items": items, "has_more": len(rows) > limit})
             if path == "/api/export":
                 repo = _qs(qs, "repo")
-                bundle = ctx.store.export_bundle(repo_id=repo)
+                bundle = store.export_bundle(repo_id=repo)
                 if repo and not bundle["repositories"]:
                     raise ApiError(404, "repository not found")
                 return self._json(
                     200, bundle,
                     headers={"Content-Disposition": "attachment;"
                              ' filename="partial-export.json"'})
-            if path == "/api/bundles":
-                raise ApiError(404, "not found")
             m = _match(path, "/api/repos/")
             if m:
                 if not _ID64_RE.fullmatch(m):
                     raise ApiError(404, "repository not found")
-                repo = ctx.store.get_repo(m)
+                repo = store.get_repo(m)
                 if repo is None:
                     raise ApiError(404, "repository not found")
                 return self._json(200, {
@@ -440,16 +488,16 @@ def _make_handler(ctx):
                         "remote": repo["remote"],
                         "created_at": repo["created_at"],
                     },
-                    "branches": ctx.store.repo_branches(m)})
+                    "branches": store.repo_branches(m)})
             m = _match(path, "/api/sessions/", suffix="/handoff")
             if m:
                 if not _ID64_RE.fullmatch(m):
                     raise ApiError(404, "session not found")
-                sess = ctx.store.get_session(m)
+                sess = store.get_session(m)
                 if sess is None:
                     raise ApiError(404, "session not found")
                 for e in sess["events"]:
-                    e["data"] = ctx.store.strip_paths(
+                    e["data"] = store.strip_paths(
                         e.get("data") or {}, sess["repo_id"])
                 body = format_handoff(sess).encode()
                 return self._send(
@@ -462,90 +510,210 @@ def _make_handler(ctx):
                     })
             m = _match(path, "/api/sessions/")
             if m:
-                return self._session_detail(m, qs)
+                return self._session_detail(store, m, qs)
             m = _match(path, "/api/checkpoints/", suffix="/reviews")
             if m:
                 if not _ID32_RE.fullmatch(m) or \
-                        ctx.store.get_checkpoint(m) is None:
+                        store.get_checkpoint(m) is None:
                     raise ApiError(404, "checkpoint not found")
                 return self._json(200, {
-                    "items": ctx.store.list_reviews(m)})
+                    "items": store.list_reviews(m)})
             m = _match(path, "/api/checkpoints/")
             if m:
                 if not _ID32_RE.fullmatch(m):
                     raise ApiError(404, "checkpoint not found")
-                cp = ctx.store.get_checkpoint(m)
+                cp = store.get_checkpoint(m)
                 if cp is None:
                     raise ApiError(404, "checkpoint not found")
                 sessions = [_safe_session(s) for s in
-                            ctx.store.sessions_for_checkpoint(m)]
+                            store.sessions_for_checkpoint(m)]
                 return self._json(200, {
                     "checkpoint": _safe_checkpoint(cp, full=True),
                     "sessions": sessions})
             raise ApiError(404, "not found")
 
-        def _session_detail(self, sid, qs):
+        def _session_detail(self, store, sid, qs):
             if not _ID64_RE.fullmatch(sid):
                 raise ApiError(404, "session not found")
-            row = ctx.store.get_session_meta(sid)
+            row = store.get_session_meta(sid)
             if row is None:
                 raise ApiError(404, "session not found")
             limit, offset = _page(qs, 200, 500)
-            rows = ctx.store.session_events_page(
+            rows = store.session_events_page(
                 row["id"], limit=limit + 1, offset=offset,
                 kind=_qs(qs, "kind"))
             events = []
             for e in rows[:limit]:
-                e["data"] = ctx.store.strip_paths(
+                e["data"] = store.strip_paths(
                     e.get("data") or {}, row["repo_id"])
                 events.append(_safe_event(e))
             children = [_safe_session(s)
-                        for s in ctx.store.child_sessions(row["id"])]
+                        for s in store.child_sessions(row["id"])]
             return self._json(200, {
                 "session": _safe_session(row),
                 "events": events,
                 "has_more": len(rows) > limit,
-                "checkpoints": ctx.store.checkpoints_for_session(
+                "checkpoints": store.checkpoints_for_session(
                     row["id"]),
                 "children": children})
 
-        def _post(self, path, body):
-            if path == "/api/login":
-                return self._login(body)
-            if path == "/api/logout":
-                self._read_json(body)
-                return self._logout()
-            if not self._authed():
-                raise ApiError(401, "authentication required")
-            if path == "/api/bundles":
-                obj = self._read_json(body)
-                if not isinstance(obj, dict):
-                    raise ApiError(400, "expected a bundle object")
-                result = ctx.store.import_bundle(obj)
-                return self._json(200, {"ok": True, "counts": result})
-            m = _match(path, "/api/checkpoints/", suffix="/reviews")
-            if m:
-                if not _ID32_RE.fullmatch(m) or \
-                        ctx.store.get_checkpoint(m) is None:
-                    raise ApiError(404, "checkpoint not found")
-                obj = self._read_json(body)
-                if not isinstance(obj, dict):
-                    raise ApiError(400, "expected an object")
-                author = obj.get("author")
-                body = obj.get("body")
-                if not isinstance(author, str) or not isinstance(
-                        body, str):
-                    raise ApiError(400, "author and body required")
-                if not author.strip() or len(author.strip()) > 80 \
-                        or not body.strip() \
-                        or len(body.strip()) > 10000:
-                    raise ApiError(
-                        400, "author 1..80, body 1..10000 chars")
+        def _principal_workspaces(self, principal: Principal):
+            if principal.token_id is not None:
+                conn = ctx.accounts._connect()
                 try:
-                    review = ctx.store.add_review(
-                        m, author, body)
-                except KeyError:
+                    row = conn.execute(
+                        "SELECT * FROM workspaces WHERE id=?",
+                        (principal.workspace_id,)).fetchone()
+                    if row is None:
+                        return []
+                    return [{"id": row["id"], "name": row["name"],
+                             "created_at": row["created_at"],
+                             "role": principal.token_role}]
+                finally:
+                    conn.close()
+            return ctx.accounts.workspaces(principal)
+
+        def _me(self, principal: Principal):
+            if ctx.demo:
+                return self._json(200, {
+                    "authenticated": True, "demo": True,
+                    "version": __version__,
+                    "user": {"id": "demo", "email": "demo@localhost",
+                             "name": "Demo"},
+                    "workspaces": [{
+                        "id": "demo", "name": "Demo workspace",
+                        "role": "owner"}],
+                    "workspace": {
+                        "id": "demo", "name": "Demo workspace",
+                        "role": "owner"}})
+            wss = self._principal_workspaces(principal)
+            if not wss:
+                raise ApiError(404, "workspace not found")
+            want = self.headers.get(WS_HEADER)
+            ws = None
+            if principal.token_id is not None:
+                if want and want != principal.workspace_id:
+                    raise ApiError(404, "workspace not found")
+                ws = wss[0]
+            elif want:
+                ws = next(
+                    (w for w in wss if w["id"] == want), None)
+                if ws is None:
+                    raise ApiError(404, "workspace not found")
+            else:
+                ws = wss[0]
+            return self._json(200, {
+                "authenticated": True, "demo": False,
+                "version": __version__,
+                "user": {"id": principal.user_id,
+                         "email": principal.email,
+                         "name": principal.name},
+                "workspaces": wss, "workspace": ws})
+
+        def _write(self, method, path, body, browser_origin):
+            if ctx.demo:
+                if body:
+                    self._read_json(body)
+                raise ApiError(403, "demo workspace is read-only")
+            if method == "POST" and path in (
+                    "/api/login", "/api/setup", "/api/invites/accept"):
+                if not browser_origin:
+                    raise ApiError(403, "origin required")
+                if path == "/api/login":
+                    return self._login(body)
+                if path == "/api/setup":
+                    return self._setup(body)
+                return self._accept_invite(body)
+            principal = self._principal()
+            if principal is None:
+                raise ApiError(401, "authentication required")
+            self._guard_write(browser_origin, principal)
+            if method == "POST" and path == "/api/logout":
+                if body:
+                    self._read_json(body)
+                return self._logout()
+            if method == "POST" and path == "/api/bundles":
+                store, _ws = self._resolve_ws(principal, write=True)
+                obj = _obj(self._read_json(body))
+                result = store.import_bundle(obj)
+                return self._json(200, {"ok": True, "counts": result})
+            if method == "POST" and path == "/api/account/password":
+                if principal.token_id is not None:
+                    raise ApiError(403, "password change requires"
+                                    " browser sign-in")
+                obj = _obj(self._read_json(body))
+                ctx.accounts.change_password(
+                    principal, obj.get("current_password"),
+                    obj.get("new_password"))
+                return self._json(200, {"ok": True}, headers={
+                    "Set-Cookie": self._cookie("", 0)})
+            if method == "POST" and path == "/api/workspaces":
+                if principal.token_id is not None:
+                    raise ApiError(403, "API tokens cannot create"
+                                    " workspaces")
+                obj = _obj(self._read_json(body))
+                ws = ctx.accounts.create_workspace(
+                    principal, obj.get("name"))
+                return self._json(201, {"item": ws})
+            m = _match(path, "/api/workspaces/", suffix="/invites")
+            if m and method == "POST":
+                if principal.token_id is not None:
+                    raise ApiError(
+                        403, "API tokens cannot create invites")
+                obj = _obj(self._read_json(body))
+                item = ctx.accounts.invite(
+                    principal, m, obj.get("email"), obj.get("role"))
+                return self._json(201, {"item": item})
+            m = _match(path, "/api/workspaces/", suffix="/tokens")
+            if m and method == "POST":
+                if principal.token_id is not None:
+                    raise ApiError(
+                        403, "API tokens cannot create tokens")
+                obj = _obj(self._read_json(body))
+                item = ctx.accounts.create_api_token(
+                    principal, m, obj.get("name"), obj.get("role"),
+                    obj.get("expires_days", 90))
+                return self._json(201, {"item": item})
+            m = _match2(path, "/api/workspaces/", "/members/")
+            if m and method == "PATCH":
+                if principal.token_id is not None:
+                    raise ApiError(
+                        403, "API tokens cannot manage members")
+                ws_id, uid = m
+                obj = _obj(self._read_json(body))
+                ctx.accounts.change_member(
+                    principal, ws_id, uid, obj.get("role"))
+                return self._json(200, {"ok": True})
+            if m and method == "DELETE":
+                if principal.token_id is not None:
+                    raise ApiError(
+                        403, "API tokens cannot manage members")
+                ws_id, uid = m
+                if body:
+                    self._read_json(body)
+                ctx.accounts.remove_member(principal, ws_id, uid)
+                return self._json(200, {"ok": True})
+            m = _match(path, "/api/tokens/")
+            if m and method == "DELETE":
+                if body:
+                    self._read_json(body)
+                ctx.accounts.revoke_api_token(principal, m)
+                return self._json(200, {"ok": True})
+            m = _match(path, "/api/checkpoints/", suffix="/reviews")
+            if m and method == "POST":
+                store, _ws = self._resolve_ws(principal, write=True)
+                if not _ID32_RE.fullmatch(m) or \
+                        store.get_checkpoint(m) is None:
                     raise ApiError(404, "checkpoint not found")
+                obj = _obj(self._read_json(body))
+                body_text = obj.get("body")
+                if not isinstance(body_text, str) \
+                        or not body_text.strip() \
+                        or len(body_text.strip()) > 10000:
+                    raise ApiError(400, "body 1..10000 chars")
+                review = store.add_review(
+                    m, principal.name, body_text,
+                    actor=principal.user_id)
                 return self._json(201, {"item": review})
             raise ApiError(404, "not found")
 
@@ -553,30 +721,58 @@ def _make_handler(ctx):
             ip = self.client_address[0]
             if not ctx.check_login_rate(ip):
                 raise ApiError(429, "too many login attempts")
-            obj = self._read_json(body)
-            token = obj.get("token") if isinstance(obj, dict) else None
-            if not isinstance(token, str) or not secrets.compare_digest(
-                    token.encode(), ctx.token.encode()):
-                raise ApiError(401, "invalid token")
-            sess = ctx.new_session()
-            cookie = (f"{COOKIE_NAME}={sess}; HttpOnly;"
-                      " SameSite=Strict; Path=/;"
-                      f" Max-Age={SESSION_TTL}")
-            if ctx.secure_cookie:
-                cookie += "; Secure"
-            self._json(200, {"ok": True},
-                       headers={"Set-Cookie": cookie})
+            obj = _obj(self._read_json(body))
+            try:
+                raw, principal = ctx.accounts.login(
+                    obj.get("email"), obj.get("password"))
+            except AccountsError:
+                raise ApiError(401, "invalid credentials")
+            self._json(200, {"ok": True}, headers={
+                "Set-Cookie": self._cookie(raw, SESSION_TTL)})
+
+        def _setup(self, body):
+            if ctx.demo:
+                raise ApiError(403, "demo workspace is read-only")
+            ip = self.client_address[0]
+            if not ctx.check_login_rate(ip):
+                raise ApiError(429, "too many requests")
+            obj = _obj(self._read_json(body))
+            bt = obj.get("bootstrap_token")
+            if not isinstance(bt, str) or not secrets.compare_digest(
+                    bt.encode(), ctx.token.encode()):
+                raise ApiError(401, "invalid bootstrap token")
+            ctx.accounts.setup(
+                email=obj.get("email"), name=obj.get("name"),
+                password=obj.get("password"))
+            raw, _p = ctx.accounts.login(
+                obj.get("email"), obj.get("password"))
+            self._json(200, {"ok": True}, headers={
+                "Set-Cookie": self._cookie(raw, SESSION_TTL)})
+
+        def _accept_invite(self, body):
+            if ctx.demo:
+                raise ApiError(403, "demo workspace is read-only")
+            ip = self.client_address[0]
+            if not ctx.check_login_rate(ip):
+                raise ApiError(429, "too many requests")
+            obj = _obj(self._read_json(body))
+            principal = self._principal()
+            try:
+                ctx.accounts.accept_invite(
+                    token=obj.get("token"), email=obj.get("email"),
+                    name=obj.get("name") or "",
+                    password=obj.get("password") or "",
+                    principal=principal)
+            except AccountsError as exc:
+                raise ApiError(exc.code, str(exc))
+            self._json(200, {"ok": True})
 
         def _logout(self):
-            tok = self._cookie_token()
-            if tok:
-                ctx.revoke_session(tok)
-            cookie = (f"{COOKIE_NAME}=; HttpOnly; SameSite=Strict;"
-                      " Path=/; Max-Age=0")
-            if ctx.secure_cookie:
-                cookie += "; Secure"
-            self._json(200, {"ok": True},
-                       headers={"Set-Cookie": cookie})
+            raw = self._cookie_raw()
+            if raw:
+                ctx.accounts.logout(raw)
+            self._json(200, {"ok": True}, headers={
+                "Set-Cookie": self._cookie("", 0)})
 
     return Handler
 
@@ -592,6 +788,19 @@ def _match(path: str, prefix: str, suffix: str = "") -> str | None:
     if "/" in rest or not rest:
         return None
     return rest
+
+
+def _match2(path: str, prefix: str, mid: str) -> tuple | None:
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    i = rest.find(mid)
+    if i <= 0:
+        return None
+    a, b = rest[:i], rest[i + len(mid):]
+    if not a or not b or "/" in a or "/" in b:
+        return None
+    return a, b
 
 
 def _qs(qs: dict, key: str) -> str | None:
@@ -709,8 +918,8 @@ def serve(
     if demo:
         print("Demo workspace: sample data only (read-only).")
     else:
-        print("Run `partial auth token` to obtain your workspace"
-              " access token.")
+        print("Run `partial auth token` to obtain the bootstrap token"
+              " for first-time setup.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

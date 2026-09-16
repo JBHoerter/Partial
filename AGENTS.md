@@ -26,14 +26,28 @@ Zero runtime dependencies; Python >= 3.11; stdlib only
   merge, metadata branch persistence via plumbing (`read-tree`/
   `update-index`/`write-tree`/`commit-tree`/CAS `update-ref`) on
   `refs/heads/partial/checkpoints/v1`, and push/pull sync.
-- `partial/auth.py` — workspace token (`PARTIAL_TOKEN` env or
-  `<home>/server-token`, generated 0600, never rotated silently).
+- `partial/auth.py` — bootstrap token (`PARTIAL_TOKEN` env or
+  `<home>/server-token`, generated 0600, never rotated silently). Used
+  only for first-time `POST /api/setup` once accounts exist.
+- `partial/accounts.py` — identity DB at `<home>/accounts.db`
+  (users, workspaces, memberships, hashed auth sessions, invites,
+  workspace-scoped API tokens, audit log). Each workspace gets its own
+  `Store` database — the legacy workspace binds `<home>/partial.db`,
+  new workspaces live at `<home>/workspaces/<uuid>/partial.db`; all
+  queries/import/export are physically isolated per workspace. Roles:
+  owner/admin/member/viewer; PBKDF2-HMAC-SHA256 (600k) passwords;
+  only SHA-256 token hashes are persisted.
 - `partial/handoff.py` — shared Markdown handoff formatter (recorded
   context only, no generated instructions).
 - `partial/server.py` — `http.server.ThreadingHTTPServer` JSON API +
-  static file whitelist. Bearer token or 12h HttpOnly SameSite=Strict
-  session cookie (login via `POST /api/login`); Host/Origin allowlists,
-  per-IP login rate limit, 16 MiB body cap, security headers, no CORS.
+  static file whitelist. Auth: workspace-scoped API-token bearer or
+  12h HttpOnly SameSite=Strict account session cookie (persisted
+  token hashes, survive restarts). Requests select the workspace via
+  `X-Partial-Workspace` (default: first membership; API tokens are
+  pinned to their own workspace). Host/Origin allowlists, per-IP
+  rate limit on login/setup/invite-accept, 16 MiB body cap, security
+  headers, no CORS. Unknown or non-member workspaces return 404;
+  insufficient role returns 403; API tokens cannot administer.
 - `partial/demo.py` — synthetic demo fixture (temp store, only used by
   `serve --demo`; read-only API).
 - `partial/static/` — landing page (`index.html`) and the workspace SPA
@@ -61,8 +75,11 @@ partial run codex [args...]    # wraps `codex exec --json`
 partial run claude [args...]   # wraps `claude --settings <generated>`
 partial run devin [args...]
 partial serve [--host H] [--port P] [--public-url URL] [--demo]
-partial auth token           # prints the workspace access token
-partial upload SERVER_URL [--repo-only]   # token via PARTIAL_SERVER_TOKEN
+partial auth token           # prints the bootstrap token (pre-setup only)
+partial account create --email E --name N [--password-stdin]
+partial account token --email E --workspace ID --name N \
+    [--role member] [--expires-days N] [--password-stdin]
+partial upload SERVER_URL [--repo-only] [--workspace ID]   # PARTIAL_SERVER_TOKEN
 partial ingest-bundle FILE   # local bundle import
 ```
 
@@ -80,17 +97,25 @@ partial enable --agent all
 partial serve
 ```
 
-In another activated terminal, run `partial auth token` to get the
-login token. Keep the virtual environment activated when running
-agents so the installed `partial` hook command is on PATH. For
-persistent installation instead, use `uv tool install .`.
+First run: open the printed URL, which shows a setup form. The
+bootstrap token from `partial auth token` is required there once to
+create the owner account and bind the legacy workspace; afterwards it
+grants no access — sign in with email/password, and mint
+workspace-scoped API tokens under Settings. Alternatively create the
+owner locally with `partial account create`. Registration beyond the
+owner is invitation-only (owner/admin creates invite tokens; invitees
+paste them on the sign-in page). Keep the virtual environment
+activated when running agents so the installed `partial` hook command
+is on PATH. For persistent installation instead, use
+`uv tool install .`.
 
-The server targets a single trusted workspace: every token holder is a
-workspace member, not a separate account. Bind loopback by default;
-for remote access put it behind a TLS reverse proxy and pass
-`--public-url https://…` with an explicit `PARTIAL_TOKEN`. Bundles
-contain recorded session context — only upload/import them into
-workspaces you trust; there is no telemetry.
+The server targets a single trusted team: workspaces isolate all
+captured data per tenant (separate SQLite DBs, never shared
+predicates). Bind loopback by default; for remote access put it
+behind a TLS reverse proxy and pass `--public-url https://…` with an
+explicit `PARTIAL_TOKEN`. Bundles contain recorded session context —
+only upload/import them into workspaces you trust; there is no
+telemetry.
 
 ## Tests
 
@@ -116,13 +141,16 @@ bare hook invocations find the right DB.
 ## Server
 
 `partial serve` binds loopback by default and prints only the URL —
-tokens come from `partial auth token` or `PARTIAL_TOKEN`. Non-loopback
-binds require `--public-url https://…` and an explicit `PARTIAL_TOKEN`;
-the stdlib server is meant to sit behind a TLS reverse proxy. `partial
-upload` posts an exported bundle to `POST /api/bundles` with a bearer
-token, refuses redirects, and requires HTTPS off-loopback.
-`partial serve --demo` uses an isolated temp store with synthetic data;
-all mutation endpoints return 403.
+the bootstrap token comes from `partial auth token` or `PARTIAL_TOKEN`
+and is consumed by the first-run setup only. Non-loopback binds
+require `--public-url https://…` and an explicit `PARTIAL_TOKEN`;
+the stdlib server is meant to sit behind a TLS reverse proxy.
+`partial upload` posts an exported bundle to `POST /api/bundles` with
+a workspace API token via `PARTIAL_SERVER_TOKEN` (minted under
+Settings or `partial account token`), refuses redirects, and requires
+HTTPS off-loopback; `--workspace ID` pins the target workspace.
+`partial serve --demo` uses an isolated temp store with synthetic
+data; all mutation endpoints return 403 and no accounts are created.
 
 ## Devin hook format
 

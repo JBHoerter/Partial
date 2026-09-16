@@ -4,6 +4,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,6 +19,8 @@ from partial.server import create_server
 from partial.store import Store
 
 TOKEN = "smoke-" + "t" * 40
+EMAIL = "owner@smoke.test"
+PASSWORD = "smoke passphrase"
 TS = "2026-09-16T10:00:00Z"
 
 
@@ -90,6 +94,18 @@ class Smoke(unittest.TestCase):
         cls.demo_store = create_demo_store()
         cls.auth = Server(cls.auth_store)
         cls.demo = Server(cls.demo_store, demo=True)
+        import urllib.request
+        req = urllib.request.Request(
+            cls.auth.base + "/api/setup",
+            data=json.dumps({
+                "email": EMAIL, "name": "Smoke Owner",
+                "password": PASSWORD, "bootstrap_token": TOKEN,
+            }).encode(),
+            headers={"Content-Type": "application/json",
+                     "Origin": cls.auth.base},
+            method="POST")
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
         cls.errors = []
         cls.pw = sync_playwright().start()
         cls.browser = cls.pw.chromium.launch()
@@ -115,12 +131,34 @@ class Smoke(unittest.TestCase):
         page.on("pageerror", lambda e: self.errors.append(str(e)))
         return ctx, page
 
-    def login(self, page, base):
+    def login(self, page, base, email=EMAIL, password=PASSWORD):
+        acc = self.auth.srv.partial_context.accounts
+        raw, _p = acc.login(email, password)
+        page.context.add_cookies([{
+            "name": "partial_session", "value": raw, "url": base}])
         page.goto(base + "/app")
-        page.wait_for_selector("#login:not([hidden])")
-        page.fill("#login-token", TOKEN)
-        page.click("#login-form button[type=submit]")
         page.wait_for_selector("#shell:not([hidden])")
+
+    def api(self, method, path, obj=None, cookie=None, ws=None):
+        h = {"Content-Type": "application/json",
+             "Origin": self.auth.base}
+        if cookie:
+            h["Cookie"] = "partial_session=" + cookie
+        if ws:
+            h["X-Partial-Workspace"] = ws
+        req = urllib.request.Request(
+            self.auth.base + path,
+            data=json.dumps(obj).encode() if obj is not None else None,
+            headers=h, method=method)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, json.loads(raw or b"{}")
+            except json.JSONDecodeError:
+                return e.code, {}
 
     def test_01_demo_visibility_and_pages(self):
         ctx, page = self.page()
@@ -184,11 +222,12 @@ class Smoke(unittest.TestCase):
         page.goto(self.auth.base + "/app#/sessions")
         page.wait_for_selector("#login:not([hidden])")
         self.assertFalse(page.locator("#shell").is_visible())
-        page.fill("#login-token", "definitely-wrong")
+        page.fill("#login-email", EMAIL)
+        page.fill("#login-password", "definitely-wrong")
         page.click("#login-form button[type=submit]")
         page.wait_for_selector("#login-error:not(:empty)")
         self.assertFalse(page.locator("#shell").is_visible())
-        page.fill("#login-token", TOKEN)
+        page.fill("#login-password", PASSWORD)
         page.click("#login-form button[type=submit]")
         page.wait_for_selector("table.list")
         self.assertFalse(page.locator("#login").is_visible())
@@ -232,7 +271,6 @@ class Smoke(unittest.TestCase):
         cpid = self.cpid
         page.goto(self.auth.base + f"/app#/checkpoints/{cpid}")
         page.wait_for_selector("textarea[aria-label='Review note']")
-        page.fill("input[aria-label='Reviewer name']", "Smoke Tester")
         page.fill("textarea[aria-label='Review note']",
                   "browser smoke note")
         page.click("button:has-text('Add note')")
@@ -314,6 +352,222 @@ class Smoke(unittest.TestCase):
         summ.focus()
         page.keyboard.press("Enter")
         self.assertFalse(det.evaluate("e => e.open"))
+        ctx.close()
+
+    def test_10_workspaces_invite_isolation(self):
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector("input[aria-label='Workspace name']")
+        page.fill("input[aria-label='Workspace name']", "second-ws")
+        page.locator(
+            "#view button:has-text('Create workspace')").click()
+        page.wait_for_selector(".notice-ok")
+        sel = page.locator("#ws-select")
+        self.assertEqual(sel.locator("option").count(), 2)
+        sel.select_option(label="second-ws")
+        page.wait_for_selector("text=Every change has a story")
+        self.assertIn("No sessions captured",
+                      page.locator("#view").inner_text())
+        self.assertEqual(
+            page.evaluate(
+                "localStorage.getItem('partial_workspace_id')"),
+            sel.input_value())
+        sel.select_option(index=0)
+        page.wait_for_selector("text=Every change has a story")
+
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector("input[aria-label='Invitee email']")
+        page.fill("input[aria-label='Invitee email']",
+                  "viewer@smoke.test")
+        page.select_option("select[aria-label='Invite role']",
+                           "viewer")
+        page.locator(
+            "#view button:has-text('Create invitation')").click()
+        page.wait_for_selector(".notice-ok")
+        invite_token = page.locator(
+            "#view .cmdline code").last.inner_text()
+
+        page.click("#logout-btn")
+        page.wait_for_selector("#login:not([hidden])")
+        page.click("#invite-toggle")
+        page.fill("#invite-token", invite_token)
+        page.fill("#invite-email", "viewer@smoke.test")
+        page.fill("#invite-name", "Smoke Viewer")
+        page.fill("#invite-password", "viewer passphrase")
+        page.click("#invite-form button[type=submit]")
+        page.wait_for_selector(
+            "text=Invitation accepted")
+        self.login(page, self.auth.base, "viewer@smoke.test",
+                   "viewer passphrase")
+        page.goto(
+            self.auth.base + f"/app#/checkpoints/{self.cpid}")
+        page.wait_for_selector("text=Review notes")
+        self.assertEqual(
+            page.locator("textarea[aria-label='Review note']")
+            .count(), 0)
+        self.assertIn("read-only",
+                      page.locator("#view").inner_text())
+        page.goto(self.auth.base + "/app#/integrations")
+        page.wait_for_selector("input[aria-label='Bundle file']")
+        self.assertTrue(page.locator(
+            "input[aria-label='Bundle file']").is_disabled())
+        self.assertEqual(
+            page.locator("button:has-text('Upload bundle')")
+            .is_enabled(), False)
+        ctx.close()
+
+    def test_11_token_shown_once_not_stored(self):
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector("input[aria-label='Token name']")
+        page.fill("input[aria-label='Token name']", "ephemeral")
+        page.locator(
+            "#view button:has-text('Create token')").click()
+        page.wait_for_selector(".notice-ok")
+        token = page.locator("#view .cmdline code").first.inner_text()
+        self.assertTrue(token.startswith("ptk_"))
+        stored = page.evaluate(
+            "JSON.stringify(localStorage)")
+        self.assertNotIn(token, stored)
+        page.goto(self.auth.base + "/app#/overview")
+        page.wait_for_selector("text=Every change has a story")
+        self.assertNotIn(token, page.locator("#view").inner_text())
+        ctx.close()
+
+    def test_12_existing_user_accepts_invite(self):
+        acc = self.auth.srv.partial_context.accounts
+        raw_o, _p = acc.login(EMAIL, PASSWORD)
+        status, me = self.api("GET", "/api/me", cookie=raw_o)
+        self.assertEqual(status, 200)
+        ws1 = me["workspace"]["id"]
+        status, d = self.api(
+            "POST", f"/api/workspaces/{ws1}/invites",
+            {"email": "two@smoke.test", "role": "member"},
+            cookie=raw_o)
+        self.assertEqual(status, 201, d)
+        status, d = self.api(
+            "POST", "/api/invites/accept",
+            {"token": d["item"]["token"], "email": "two@smoke.test",
+             "name": "Two", "password": "two passphrase"})
+        self.assertEqual(status, 200, d)
+        raw2, _p = acc.login("two@smoke.test", "two passphrase")
+        status, d = self.api(
+            "POST", "/api/workspaces", {"name": "two-space"},
+            cookie=raw2)
+        self.assertEqual(status, 201, d)
+        ws_b = d["item"]["id"]
+        status, d = self.api(
+            "POST", f"/api/workspaces/{ws_b}/invites",
+            {"email": EMAIL, "role": "member"}, cookie=raw2)
+        self.assertEqual(status, 201, d)
+        tok = d["item"]["token"]
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        before = page.locator("#ws-select option").count()
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector(
+            "#view input[aria-label='Invitation token']")
+        page.fill("#view input[aria-label='Invitation token']", tok)
+        page.locator(
+            "#view button:has-text('Accept invitation')").click()
+        page.wait_for_selector(".notice-ok")
+        self.assertEqual(
+            page.locator("#view input[aria-label='Invitation token']")
+            .input_value(), "")
+        labels = page.locator("#ws-select option").all_inner_texts()
+        self.assertIn("two-space", labels)
+        self.assertEqual(len(labels), before + 1)
+        ctx.close()
+
+    def test_13_workspace_switch_upload_race(self):
+        acc = self.auth.srv.partial_context.accounts
+        raw_o, _p = acc.login(EMAIL, PASSWORD)
+        status, me = self.api("GET", "/api/me", cookie=raw_o)
+        ws1 = me["workspace"]["id"]
+        status, d = self.api(
+            "POST", "/api/workspaces", {"name": "race-ws"},
+            cookie=raw_o)
+        self.assertEqual(status, 201, d)
+        ws2 = d["item"]["id"]
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        resp = page.context.request.get(
+            self.auth.base + "/api/export")
+        bundle_file = Path(self.tmp.name) / "race.json"
+        bundle_file.write_bytes(resp.body())
+        release = threading.Event()
+        seen = {}
+
+        def hold(route):
+            seen["ws"] = route.request.headers.get(
+                "x-partial-workspace")
+            release.wait(10)
+            route.continue_()
+
+        page.route("**/api/bundles", hold)
+        page.goto(self.auth.base + "/app#/integrations")
+        page.wait_for_selector("input[aria-label='Bundle file']")
+        page.set_input_files("input[aria-label='Bundle file']",
+                             str(bundle_file))
+        page.click("button:has-text('Upload bundle')")
+        for _ in range(50):
+            if "ws" in seen:
+                break
+            page.wait_for_timeout(100)
+        page.locator("#ws-select").select_option(ws2)
+        release.set()
+        page.wait_for_timeout(600)
+        page.unroute("**/api/bundles")
+        self.assertEqual(seen.get("ws"), ws1)
+        status, d = self.api(
+            "GET", "/api/sessions", cookie=raw_o, ws=ws2)
+        self.assertEqual(status, 200)
+        self.assertEqual(d["items"], [])
+        ctx.close()
+
+    def test_14_settings_role_controls(self):
+        acc = self.auth.srv.partial_context.accounts
+        raw2, _p = acc.login("two@smoke.test", "two passphrase")
+        status, me = self.api("GET", "/api/me", cookie=raw2)
+        uid_two = me["user"]["id"]
+        raw_o, _p = acc.login(EMAIL, PASSWORD)
+        status, me = self.api("GET", "/api/me", cookie=raw_o)
+        ws1 = me["workspace"]["id"]
+        status, d = self.api(
+            "PATCH", f"/api/workspaces/{ws1}/members/{uid_two}",
+            {"role": "admin"}, cookie=raw_o)
+        self.assertEqual(status, 200, d)
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base)
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector("select[aria-label='Token role']")
+        opts = sorted(page.locator(
+            "select[aria-label='Token role'] option")
+            .all_inner_texts())
+        self.assertEqual(opts, ["member", "viewer"])
+        self.assertEqual(page.locator(
+            "select[aria-label='Token role']").input_value(),
+            "member")
+        ctx.close()
+
+        ctx, page = self.page()
+        self.login(page, self.auth.base, "two@smoke.test",
+                   "two passphrase")
+        page.goto(self.auth.base + "/app#/settings")
+        page.wait_for_selector("table.list")
+        mpanel = page.locator(".panel").filter(
+            has=page.locator("h3", has_text="Members")).first
+        owner_row = mpanel.locator("tr", has_text=EMAIL)
+        self.assertEqual(
+            owner_row.locator("select").count(), 0)
+        self.assertEqual(
+            owner_row.locator("button", has_text="Remove").count(),
+            0)
         ctx.close()
 
     def test_99_no_console_errors(self):
