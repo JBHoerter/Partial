@@ -7,10 +7,18 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 from . import __version__
-from .adapters import codex_event, normalize_hook, parse_import
+from .adapters import (
+    codex_event,
+    namespace_codex_events,
+    normalize_hook,
+    parse_import,
+)
 from .git import (
     GitError,
     check_agent_configs,
@@ -25,8 +33,10 @@ from .git import (
     load_local_config,
     persist_checkpoint,
     repo_id_for_repo,
+    save_local_config,
     sync_checkpoints,
 )
+from .handoff import format_handoff
 from .models import (
     AGENTS,
     MAX_IMPORT_BYTES,
@@ -36,7 +46,7 @@ from .models import (
     scoped_session_id,
 )
 from .privacy import redact
-from .store import Store
+from .store import Store, default_db_path
 
 HOOK_STDIN_CAP = 2 * 1024 * 1024
 LINE_CAP = 1024 * 1024
@@ -46,6 +56,20 @@ def _store(args) -> Store:
     if args.home:
         return Store(Path(args.home) / "partial.db")
     return Store()
+
+
+def _store_for_repo(args, repo: dict) -> Store:
+    if not args.home and "PARTIAL_HOME" not in os.environ:
+        home = load_local_config(repo).get("home")
+        if isinstance(home, str) and home:
+            return Store(Path(home) / "partial.db")
+    return _store(args)
+
+
+def _home_dir(args) -> Path:
+    if args.home:
+        return Path(args.home)
+    return default_db_path().parent
 
 
 def _repo_root_arg(args) -> str:
@@ -83,6 +107,9 @@ def _cmd_enable(args) -> int:
         _warn(e)
     if result["errors"]:
         return 2
+    cfg = load_local_config(repo)
+    cfg["home"] = str(Path(store.path.parent).resolve())
+    save_local_config(repo, cfg)
     installed = list(result["installed"])
     for agent in agents:
         if agent == "devin":
@@ -205,7 +232,7 @@ def _cmd_hook(args) -> int:
         return 0
     if not events:
         return 0
-    store = _store(args)
+    store = _store_for_repo(args, repo)
     row = store.register_repo(repo["root"])
     store.ingest(
         row["id"], events,
@@ -223,7 +250,7 @@ def _hook_git(args) -> int:
         return 0
     if not load_local_config(repo).get("enabled"):
         return 0
-    store = _store(args)
+    store = _store_for_repo(args, repo)
     row = store.register_repo(repo["root"])
     try:
         cp = create_checkpoint(
@@ -383,29 +410,10 @@ def _cmd_handoff(args) -> int:
     if sess is None:
         _warn(f"session not found: {args.session_id}")
         return 2
-    out = []
-    title = sess.get("title") or sess["native_id"]
-    out.append(f"# Handoff: {title}")
-    out.append("")
-    out.append(f"- agent: {sess['agent']}")
-    out.append(f"- status: {sess['status']}")
-    if sess.get("branch"):
-        out.append(f"- branch: {sess['branch']}")
-    out.append(f"- started: {sess.get('started_at') or 'unknown'}")
-    out.append("")
-    for ev in sess["events"]:
-        out.append(f"## {ev['kind']} — {ev['timestamp']}")
-        if ev.get("tool_name"):
-            out.append(f"tool: {ev['tool_name']}")
-            data = ev.get("data") or {}
-            if data.get("tool_input") is not None:
-                out.append("```json")
-                out.append(json.dumps(data["tool_input"], indent=2)[:4000])
-                out.append("```")
-        if ev.get("text"):
-            out.append(ev["text"])
-        out.append("")
-    print("\n".join(out))
+    for e in sess["events"]:
+        e["data"] = store.strip_paths(
+            e.get("data") or {}, sess["repo_id"])
+    print(format_handoff(sess))
     return 0
 
 
@@ -418,7 +426,8 @@ def _cmd_sync(args) -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"pushed={result['pushed']} pulled={result['pulled']}")
+        print(f"pushed={result['pushed']} pulled={result['pulled']}"
+              f" merged={result['merged']}")
     for e in result["import_errors"]:
         _warn(e)
     if result["error"]:
@@ -458,7 +467,7 @@ def _run_env_cwd(args, store: Store) -> tuple[dict, str, dict, str]:
             " 'partial enable' first")
     row = store.register_repo(repo["root"])
     env = dict(os.environ)
-    env["PARTIAL_HOME"] = str(store.path.parent)
+    env["PARTIAL_HOME"] = str(Path(store.path.parent).resolve())
     return env, repo["root"], repo, row["id"]
 
 
@@ -469,6 +478,7 @@ def _cmd_run_codex(args) -> int:
     sid = ""
     seq = 0
     turn = 0
+    run_id = uuid.uuid4().hex
     prompt_text = _codex_prompt_from(args.rest)
 
     def ingest_now(evs):
@@ -476,6 +486,7 @@ def _cmd_run_codex(args) -> int:
             store.ingest(
                 repo_id, evs, worktree=repo["root"],
                 branch=repo.get("branch"))
+            _refresh_session_bundles(store, repo, repo_id, evs)
 
     try:
         proc = subprocess.Popen(
@@ -516,14 +527,11 @@ def _cmd_run_codex(args) -> int:
             if payload.get("type") == "thread.started" and \
                     payload.get("thread_id"):
                 sid = str(payload["thread_id"])
-            evs = codex_event(payload, sid or "codex")
-            for ev in evs:
-                base = ev.id
-                s = sid or "codex"
-                if base.startswith(s + ":"):
-                    base = base[len(s) + 1:]
-                ev.session_id = s
-                ev.id = f"{s}:t{turn}:l{seq}:{base}"
+            s = sid or "codex"
+            evs = namespace_codex_events(
+                codex_event(payload, s), payload,
+                sid=s, turn=turn, seq=seq, run=run_id,
+            )
             ingest_now(evs)
             if payload.get("type") == "thread.started" and sid \
                     and prompt_text:
@@ -658,6 +666,30 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("rest", nargs=argparse.REMAINDER)
     r.set_defaults(func=_cmd_run)
 
+    au = sub.add_parser("auth", help="authentication helpers")
+    ausub = au.add_subparsers(dest="auth_command")
+    at = ausub.add_parser(
+        "token", help="print the workspace access token")
+    at.set_defaults(func=_cmd_auth_token)
+
+    sv = sub.add_parser("serve", help="run the local web workspace")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=4310)
+    sv.add_argument("--public-url", default=None)
+    sv.add_argument("--demo", action="store_true")
+    sv.set_defaults(func=_cmd_serve)
+
+    up = sub.add_parser(
+        "upload", help="upload an exported bundle to a partial server")
+    up.add_argument("server_url")
+    up.add_argument("--repo-only", action="store_true")
+    up.set_defaults(func=_cmd_upload)
+
+    ib = sub.add_parser(
+        "ingest-bundle", help="import a partial bundle file")
+    ib.add_argument("file")
+    ib.set_defaults(func=_cmd_ingest_bundle)
+
     return p
 
 
@@ -667,6 +699,123 @@ def _cmd_run(args) -> int:
     if args.run_agent == "claude":
         return _cmd_run_claude(args)
     return _cmd_run_devin(args)
+
+
+def _cmd_auth_token(args) -> int:
+    from .auth import get_token
+    print(get_token(_home_dir(args)))
+    return 0
+
+
+def _cmd_serve(args) -> int:
+    if args.demo:
+        from .demo import create_demo_store
+        store = create_demo_store()
+    else:
+        store = _store(args)
+    from .server import serve
+    serve(store, host=args.host, port=args.port,
+          public_url=args.public_url, demo=args.demo)
+    return 0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _validate_upload_url(url: str) -> str:
+    from .server import _is_loopback
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise ValueError(f"invalid server URL: {url}")
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(
+            "server URL must be an http(s) URL with a host")
+    if parts.username or parts.password or parts.query \
+            or parts.fragment:
+        raise ValueError(
+            "server URL must not contain userinfo, query, or fragment")
+    if parts.path not in ("", "/"):
+        raise ValueError("server URL must not contain a path")
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError("invalid port in server URL")
+    if parts.scheme != "https" and not _is_loopback(parts.hostname):
+        raise ValueError("remote uploads require HTTPS")
+    return url.rstrip("/")
+
+
+def _cmd_upload(args) -> int:
+    token = os.environ.get("PARTIAL_SERVER_TOKEN")
+    if not token:
+        _warn("set PARTIAL_SERVER_TOKEN to the workspace access token"
+              " before uploading")
+        return 2
+    try:
+        base = _validate_upload_url(args.server_url)
+    except ValueError as exc:
+        _warn(str(exc))
+        return 2
+    store = _store(args)
+    repo_id = None
+    if args.repo_only:
+        _repo, repo_id = _register_repo(args, store)
+    bundle = store.export_bundle(repo_id=repo_id)
+    payload = json.dumps(bundle).encode()
+    if len(payload) > 16 * 1024 * 1024:
+        _warn("bundle exceeds the 16 MiB upload limit; retry with"
+              " --repo-only to upload a single repository")
+        return 2
+    req = urllib.request.Request(
+        base + "/api/bundles",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(req, timeout=30) as resp:
+            result = json.loads(resp.read(1024 * 1024 + 1) or b"{}")
+    except urllib.error.HTTPError as exc:
+        _warn(f"upload failed: HTTP {exc.code}")
+        return 1
+    except (urllib.error.URLError, OSError) as exc:
+        _warn(f"upload failed: {exc}")
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+def _cmd_ingest_bundle(args) -> int:
+    path = Path(args.file)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        _warn(str(exc))
+        return 2
+    if size > MAX_IMPORT_BYTES:
+        _warn(f"{path}: exceeds 64 MiB import limit")
+        return 2
+    try:
+        obj = json.loads(path.read_text(errors="replace"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _warn(f"{path}: invalid bundle JSON ({exc})")
+        return 2
+    store = _store(args)
+    try:
+        result = store.import_bundle(obj)
+    except ValueError as exc:
+        _warn(str(exc))
+        return 2
+    print(f"imported bundle: {result}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

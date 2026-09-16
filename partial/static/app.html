@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partial workspace</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div id="login" class="login-wrap" hidden>
+  <div class="login-panel">
+    <h1>Partial</h1>
+    <div class="sub">Sign in to this workspace</div>
+    <form id="login-form">
+      <input id="login-token" type="password" autocomplete="off"
+             placeholder="Access token" aria-label="Access token">
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+    <div id="login-error" class="notice-err" role="alert"></div>
+    <div class="hint">Get a token with <code>partial auth token</code>
+      on the machine running this server.</div>
+  </div>
+</div>
+
+<div id="shell" class="shell" hidden>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="logo">
+        <img src="/static/favicon.svg" alt="">
+        <span class="name">Partial</span>
+      </div>
+      <div class="tagline">Context, committed.</div>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/overview" data-nav="overview">Overview</a>
+      <a href="#/repos" data-nav="repos">Repositories</a>
+      <a href="#/sessions" data-nav="sessions">Sessions</a>
+      <a href="#/checkpoints" data-nav="checkpoints">Checkpoints</a>
+      <a href="#/search" data-nav="search">Search</a>
+      <a href="#/integrations" data-nav="integrations">Integrations</a>
+    </nav>
+    <div class="foot">
+      <span>Local workspace</span>
+      <span id="sys-status"></span>
+      <button id="logout-btn" class="ghost">Sign out</button>
+    </div>
+  </aside>
+  <div class="main">
+    <div id="demo-banner" class="demo-banner" hidden>
+      Demo workspace · Sample data only · Read-only
+    </div>
+    <div class="topbar">
+      <button id="menubtn" class="menubtn ghost" aria-label="Menu"
+              aria-expanded="false" aria-controls="sidebar">☰</button>
+      <span class="crumb" id="crumb">Overview</span>
+      <div class="spacer"></div>
+      <form class="gsearch" id="gsearch">
+        <input id="gsearch-q" type="search" placeholder="Search… (Ctrl+K)"
+               aria-label="Global search">
+      </form>
+    </div>
+    <main class="view" id="view" tabindex="-1"></main>
+  </div>
+</div>
+<div id="errbar" class="errbar" role="alert" aria-live="assertive"></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

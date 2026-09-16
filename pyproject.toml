@@ -8,8 +8,11 @@ version = "0.1.0"
 description = "Local-first AI session tracker with git commit checkpoints"
 readme = "AGENTS.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 dependencies = []
+
+[project.optional-dependencies]
+browser = ["playwright==1.55.0"]
 
 [project.scripts]
 partial = "partial.cli:main"

@@ -15,3 +15,5 @@ build/
 credentials*
 *.pem
 *.key
+server-token
+*.token

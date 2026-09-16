@@ -279,6 +279,10 @@ class FakeAgentTests(RepoTestCase):
         self.assertEqual(cps[0]["session_ids"], [sess["id"]])
         link = store.get_checkpoint(cps[0]["id"])["links"][0]
         self.assertEqual(link["method"], "observed-worktree-overlap")
+        blob = git(
+            self.repo, "show",
+            f"partial/checkpoints/v1:checkpoints/{cps[0]['id']}.json")
+        self.assertIn("done", blob.stdout)
 
     def test_run_requires_enabled(self):
         disabled = self.tmp / "offrepo"
@@ -335,6 +339,66 @@ class FakeAgentTests(RepoTestCase):
         self.assertEqual(
             Path(str(cap) + ".cwd").read_text(),
             str(Path(self.repo).resolve()))
+
+
+class ServerCliTests(RepoTestCase):
+    def _run(self, argv, stdin=""):
+        argv = ["--repo", str(self.repo), *argv]
+        with patch("sys.stdout", new=io.StringIO()) as out, \
+                patch("sys.stdin", io.StringIO(stdin)), \
+                patch("sys.stderr", new=io.StringIO()):
+            code = main(argv)
+        return code, out.getvalue()
+
+    def test_auth_token_created_and_stable(self):
+        with patch("sys.stdout", new=io.StringIO()) as out:
+            code = main(["auth", "token"])
+        self.assertEqual(code, 0)
+        token = out.getvalue().strip()
+        self.assertGreaterEqual(len(token), 32)
+        tokfile = self.home / "server-token"
+        self.assertTrue(tokfile.exists())
+        self.assertEqual(oct(tokfile.stat().st_mode & 0o777), "0o600")
+        with patch("sys.stdout", new=io.StringIO()) as out2:
+            main(["auth", "token"])
+        self.assertEqual(out2.getvalue().strip(), token)
+
+    def test_auth_token_bad_env(self):
+        os.environ["PARTIAL_TOKEN"] = "short"
+        try:
+            code, _ = self._run(["auth", "token"])
+            self.assertEqual(code, 1)
+        finally:
+            os.environ.pop("PARTIAL_TOKEN", None)
+
+    def test_ingest_bundle(self):
+        bundle = {"version": 1, "repositories": [], "sessions": [],
+                  "events": [], "checkpoints": []}
+        f = self.tmp / "b.json"
+        f.write_text(json.dumps(bundle))
+        with patch("sys.stdout", new=io.StringIO()) as out:
+            code = main(["ingest-bundle", str(f)])
+        self.assertEqual(code, 0)
+        self.assertIn("imported bundle", out.getvalue())
+        f.write_text("{bad")
+        code, _ = self._run(["ingest-bundle", str(f)])
+        self.assertEqual(code, 2)
+
+    def test_upload_validation(self):
+        code, _ = self._run(["upload", "http://example.com"])
+        self.assertEqual(code, 2)
+        os.environ["PARTIAL_SERVER_TOKEN"] = "t" * 40
+        try:
+            code, _ = self._run(
+                ["upload", "http://user:pw@example.com"])
+            self.assertEqual(code, 2)
+            code, _ = self._run(["upload", "http://example.com/x?y=1"])
+            self.assertEqual(code, 2)
+            code, _ = self._run(
+                ["upload", "http://example.com"])
+            self.assertEqual(code, 2)
+        finally:
+            os.environ.pop("PARTIAL_SERVER_TOKEN", None)
 
 
 if __name__ == "__main__":

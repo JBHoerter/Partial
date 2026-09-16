@@ -8,6 +8,8 @@ from pathlib import Path
 
 from partial.git import (
     METADATA_REF,
+    GitError,
+    _validate_bundles_for_repo,
     check_git_hook,
     create_checkpoint,
     disable_hooks,
@@ -18,7 +20,7 @@ from partial.git import (
     persist_checkpoint,
     sync_checkpoints,
 )
-from partial.models import Event, scoped_session_id
+from partial.models import Event, canonical_json, scoped_session_id
 from partial.store import Store
 
 from helpers import RepoTestCase, commit, git, init_repo
@@ -49,6 +51,27 @@ class DiscoverTests(RepoTestCase):
         (self.repo / "sub").mkdir()
         sub = discover_repo(self.repo / "sub")
         self.assertEqual(sub["root"], repo["root"])
+
+    def test_ssh_remote_identity_matches_registration(self):
+        self.add_commit("a.py", "x = 1\n")
+        git(self.repo, "remote", "add", "origin",
+            "git@github.com:JBHoerter/Partial.git")
+        repo = discover_repo(self.repo)
+        self.assertEqual(
+            repo["remote"], "ssh://github.com/JBHoerter/Partial.git")
+        self.assertNotIn("git@", repo["remote"])
+        store = Store(self.home / "partial.db")
+        row = store.register_repo(self.repo)
+        self.assertEqual(row["id"], repo["id"])
+        sid = scoped_session_id(row["id"], "devin", "s1")
+        store.ingest(row["id"], [prompt_event("e1", "s1")],
+                     worktree=str(self.repo.resolve()))
+        listed = store.list_sessions(repo_id=row["id"])
+        self.assertEqual([s["id"] for s in listed], [sid])
+        cp = create_checkpoint(
+            store, row["id"], session_ids=[sid],
+            worktree=str(self.repo.resolve()))
+        self.assertRegex(cp["id"], r"^[0-9a-f]{32}$")
 
 
 class CheckpointTests(RepoTestCase):
@@ -459,18 +482,139 @@ class SyncTests(RepoTestCase):
         git(repo, "-c", "user.name=T", "-c", "user.email=t@e",
             "commit", "-m", "c")
 
-    def test_pull_divergence_is_explicit(self):
-        self._make_checkpoint()
+    def test_pull_divergence_merges_union(self):
+        cp_a = self._make_checkpoint(
+            [prompt_event("pa", "s1", "alpha transcript")])
         sync_checkpoints(self.store, self.grepo, push=True)
-        git(self.repo, "update-ref", "-d", METADATA_REF)
-        self._make_checkpoint()
+
+        other = init_repo(self.tmp / "clone")
+        git(other, "remote", "add", "origin", str(self.bare))
+        orepo = discover_repo(other)
+        store2 = Store(self.tmp / "home2" / "partial.db")
+        row2 = store2.register_repo(other)
+        self.assertEqual(row2["id"], self.rid)
+        sid_b = scoped_session_id(self.rid, "devin", "sB")
+        store2.ingest(
+            self.rid,
+            [prompt_event("pb", "sB", "beta transcript")],
+            worktree=str(Path(other).resolve()))
+        self.add_commit_in(other, "b.py", "b = 2\n")
+        cp_b = create_checkpoint(
+            store2, self.rid, session_ids=[sid_b],
+            worktree=str(Path(other).resolve()))
+        persist_checkpoint(
+            orepo, store2.checkpoint_bundle(cp_b["id"]), cp_b["id"])
+
+        head_before = git(other, "rev-parse", "HEAD").stdout.strip()
+        index_before = git(
+            other, "ls-files", "-s").stdout
+        res = sync_checkpoints(store2, orepo, pull=True)
+        self.assertIsNone(res["error"], res)
+        self.assertTrue(res["diverged"])
+        self.assertTrue(res["merged"])
+        self.assertIsNotNone(store2.get_checkpoint(cp_a["id"]))
+        self.assertIsNotNone(store2.get_checkpoint(cp_b["id"]))
+        parents = git(
+            other, "rev-list", "--parents", "-n", "1",
+            METADATA_REF).stdout.split()
+        self.assertEqual(len(parents), 3)
+        res_push = sync_checkpoints(store2, orepo, push=True)
+        self.assertTrue(res_push["pushed"], res_push)
+        self.assertEqual(
+            git(other, "rev-parse", "HEAD").stdout.strip(), head_before)
+        self.assertEqual(git(other, "ls-files", "-s").stdout,
+                         index_before)
+        self.assertEqual(
+            git(other, "status", "--porcelain").stdout.strip(), "")
+
+        res2 = sync_checkpoints(self.store, self.grepo, pull=True)
+        self.assertIsNone(res2["error"], res2)
+        self.assertFalse(res2["diverged"])
+        for cp_id, text in (
+                (cp_a["id"], "alpha transcript"),
+                (cp_b["id"], "beta transcript")):
+            got = self.store.get_checkpoint(cp_id)
+            self.assertIsNotNone(got)
+            sess = self.store.get_session(got["links"][0]["session_id"])
+            self.assertEqual(sess["events"][0]["text"], text)
+
+    def test_pull_conflicting_checkpoint_refused(self):
+        cp_a = self._make_checkpoint()
+        sync_checkpoints(self.store, self.grepo, push=True)
+
+        forged = self.store.checkpoint_bundle(cp_a["id"])
+        forged["checkpoints"][0]["commit_sha"] = "f" * 40
+        tip = git(self.bare, "rev-parse", METADATA_REF).stdout.strip()
+        index = self.tmp / "forge-index"
+        env = dict(os.environ, GIT_INDEX_FILE=str(index))
+        blob = subprocess.run(
+            ["git", "-C", str(self.bare), "hash-object", "-w",
+             "--stdin"],
+            input=canonical_json(forged), capture_output=True,
+            text=True, env=env, timeout=30).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.bare), "read-tree", tip],
+            env=env, check=True, capture_output=True, timeout=30)
+        subprocess.run(
+            ["git", "-C", str(self.bare), "update-index", "--add",
+             "--cacheinfo",
+             f"100644,{blob},checkpoints/{cp_a['id']}.json"],
+            env=env, check=True, capture_output=True, timeout=30)
+        tree = subprocess.run(
+            ["git", "-C", str(self.bare), "write-tree"],
+            env=env, check=True, capture_output=True, text=True,
+            timeout=30).stdout.strip()
+        newc = subprocess.run(
+            ["git", "-C", str(self.bare), "commit-tree", tree,
+             "-p", tip, "-m", "forge"],
+            env=env, check=True, capture_output=True, text=True,
+            timeout=30).stdout.strip()
+        git(self.bare, "update-ref", METADATA_REF, newc, tip)
+
         local_ref = git(
             self.repo, "rev-parse", METADATA_REF).stdout.strip()
         res = sync_checkpoints(self.store, self.grepo, pull=True)
-        self.assertTrue(res["diverged"])
         self.assertIsNotNone(res["error"])
-        new_ref = git(self.repo, "rev-parse", METADATA_REF).stdout.strip()
-        self.assertEqual(new_ref, local_ref)
+        self.assertEqual(
+            git(self.repo, "rev-parse", METADATA_REF).stdout.strip(),
+            local_ref)
+
+    def test_sync_rejects_unconfigured_remote(self):
+        self._make_checkpoint()
+        with self.assertRaises(GitError):
+            sync_checkpoints(
+                self.store, self.grepo, pull=True, remote="-oops")
+        with self.assertRaises(GitError):
+            sync_checkpoints(
+                self.store, self.grepo, pull=True,
+                remote="https://evil.example/x")
+        with self.assertRaises(GitError):
+            sync_checkpoints(
+                self.store, self.grepo, pull=True, remote="upstream")
+
+    def test_validate_bundles_rejects_mismatched_path(self):
+        cpid = "a" * 32
+        bundle = {
+            "version": 1,
+            "repositories": [{"id": self.rid}],
+            "sessions": [],
+            "checkpoints": [{"id": "b" * 32, "repo_id": self.rid}],
+            "links": [],
+        }
+        with self.assertRaises(GitError):
+            _validate_bundles_for_repo(
+                {f"checkpoints/{cpid}.json": json.dumps(bundle)},
+                self.rid)
+        bundle["checkpoints"][0]["id"] = cpid
+        got = _validate_bundles_for_repo(
+            {f"checkpoints/{cpid}.json": json.dumps(bundle)},
+            self.rid)
+        self.assertIn(f"checkpoints/{cpid}.json", got)
+        bad = dict(bundle, sessions="nope")
+        with self.assertRaises(GitError):
+            _validate_bundles_for_repo(
+                {f"checkpoints/{cpid}.json": json.dumps(bad)},
+                self.rid)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -84,6 +85,21 @@ CREATE TABLE IF NOT EXISTS pending_paths(
     created_at TEXT NOT NULL,
     PRIMARY KEY(repo_id, session_id, path, worktree)
 );
+CREATE TABLE IF NOT EXISTS reviews(
+    id TEXT PRIMARY KEY,
+    checkpoint_id TEXT NOT NULL REFERENCES checkpoints(id),
+    author TEXT,
+    body TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_session_ts
+    ON events(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_sessions_repo_updated
+    ON sessions(repo_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_repo_created
+    ON checkpoints(repo_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_links_session
+    ON checkpoint_links(session_id);
 """
 
 MUTATING_TOOLS = {
@@ -114,13 +130,33 @@ def default_db_path() -> Path:
     return base / "partial" / "partial.db"
 
 
+_SCP_RE = re.compile(
+    r"^(?:([^@/\s]+)@)?([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9a-fA-F:]+\])"
+    r":([^\s]*)$"
+)
+
+
+def _scp_parts(u: str) -> tuple[str, str] | None:
+    if "://" in u:
+        return None
+    m = _SCP_RE.match(u)
+    if not m:
+        return None
+    user, host, path = m.group(1), m.group(2), m.group(3)
+    if not path or path.startswith("\\"):
+        return None
+    if user is None and (len(host) == 1 or path.startswith("/")):
+        return None
+    return host, path
+
+
 def normalize_remote(url: str) -> str:
     u = (url or "").strip()
     if not u:
         return ""
-    scp = re.match(r"^[^@/\s]+@([^:/\s]+):(.+)$", u)
-    if scp and "://" not in u:
-        host, path = scp.group(1), scp.group(2)
+    scp = _scp_parts(u)
+    if scp:
+        host, path = scp
     else:
         try:
             parts = urlsplit(u)
@@ -136,15 +172,23 @@ def normalize_remote(url: str) -> str:
 
 def sanitize_remote(url: str) -> str:
     u = (url or "").strip()
-    if not u or "://" not in u:
-        return re.sub(r"^[^@/\s]+@", "", u) if "@" in u.split(":")[0] else u
+    if not u:
+        return u
+    scp = _scp_parts(u)
+    if scp:
+        return f"ssh://{scp[0]}/{scp[1]}"
+    if "://" not in u:
+        return u
     try:
         parts = urlsplit(u)
     except ValueError:
         return ""
     host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    try:
+        if parts.port:
+            host = f"{host}:{parts.port}"
+    except ValueError:
+        pass
     clean = parts._replace(netloc=host, query="", fragment="")
     return clean.geturl()
 
@@ -235,6 +279,43 @@ def _relativize(path: str, worktree: str) -> str | None:
     return s
 
 
+def _like_esc(q: str) -> str:
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _strip_path_value(v: object, roots: list[str]) -> object:
+    if not isinstance(v, str) or not v.startswith("/"):
+        return v
+    for root in roots:
+        if v == root:
+            return "."
+        if v.startswith(root + "/"):
+            return v[len(root) + 1:]
+    return v
+
+
+def _strip_event_paths(data: dict, roots: list[str]) -> dict:
+    if not roots or not isinstance(data, dict):
+        return data
+    roots = sorted(set(roots), key=len, reverse=True)
+    out = dict(data)
+    ti = out.get("tool_input")
+    if isinstance(ti, dict):
+        ti = dict(ti)
+        for k in _PATH_KEYS:
+            if k in ti:
+                ti[k] = _strip_path_value(ti[k], roots)
+        out["tool_input"] = ti
+    changes = out.get("changes")
+    if isinstance(changes, list):
+        out["changes"] = [
+            {**ch, "path": _strip_path_value(ch.get("path"), roots)}
+            if isinstance(ch, dict) else ch
+            for ch in changes
+        ]
+    return out
+
+
 def _bounded_str(v: object, name: str, limit: int = _MAX_STR) -> str | None:
     if v is None:
         return None
@@ -293,7 +374,10 @@ class Store:
     def register_repo(self, path: str | Path) -> dict:
         root, common, remote = _git_identity(Path(path))
         rid = repo_id_for(root, common, remote)
-        name = Path(root).name or "repo"
+        name = str(redact(Path(root).name or "repo"))
+        safe_remote = sanitize_remote(remote)
+        if safe_remote is not None:
+            safe_remote = str(redact(safe_remote))
         conn = self._connect()
         try:
             row = conn.execute(
@@ -303,7 +387,7 @@ class Store:
                 conn.execute(
                     "INSERT INTO repositories(id,name,root,remote,created_at)"
                     " VALUES(?,?,?,?,?)",
-                    (rid, name, root, sanitize_remote(remote), now_iso()),
+                    (rid, name, root, safe_remote, now_iso()),
                 )
                 conn.commit()
             elif not row["root"]:
@@ -351,6 +435,11 @@ class Store:
                     validate_event(ev)
                     ev.data = redact(ev.data)
                     ev.text = redact(ev.text)
+                    if ev.tool_name is not None:
+                        ev.tool_name = str(redact(ev.tool_name))
+                    if ev.model is not None:
+                        ev.model = str(redact(ev.model))
+                    safe_branch = str(redact(branch)) if branch else None
                     sid = scoped_session_id(repo_id, ev.agent, ev.session_id)
                     parent_sid = (
                         scoped_session_id(repo_id, ev.agent,
@@ -369,8 +458,9 @@ class Store:
                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                             (
                                 sid, repo_id, ev.session_id, ev.agent,
-                                None, branch, wt, parent_sid, ev.model,
-                                "active", ev.timestamp, ev.timestamp,
+                                None, safe_branch, wt, parent_sid,
+                                ev.model, "active", ev.timestamp,
+                                ev.timestamp,
                             ),
                         )
                         existing = conn.execute(
@@ -405,7 +495,8 @@ class Store:
                             " WHERE id=?",
                             (
                                 status, title, ev.timestamp,
-                                branch, wt, ev.model, parent_sid, sid,
+                                safe_branch, wt, ev.model, parent_sid,
+                                sid,
                             ),
                         )
                     if track_paths and wt and ev.kind == "tool":
@@ -464,6 +555,7 @@ class Store:
         repo_id: str | None = None,
         agent: str | None = None,
         q: str | None = None,
+        branch: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
@@ -475,15 +567,168 @@ class Store:
         if agent:
             sql += " AND agent=?"
             params.append(agent)
+        if agent and agent not in AGENTS:
+            raise ValueError(f"unknown agent: {agent}")
+        if branch:
+            sql += " AND branch=?"
+            params.append(branch)
         if q:
-            like = f"%{q}%"
-            sql += " AND (title LIKE ? OR native_id LIKE ? OR branch LIKE ?)"
-            params += [like, like, like]
+            if len(q) > 500:
+                raise ValueError("search query too long (max 500)")
+            like = f"%{_like_esc(q)}%"
+            sql += (" AND (title LIKE ? ESCAPE '\\'"
+                    " OR native_id LIKE ? ESCAPE '\\'"
+                    " OR branch LIKE ? ESCAPE '\\'"
+                    " OR EXISTS(SELECT 1 FROM events e"
+                    " WHERE e.session_id=sessions.id"
+                    " AND (e.text LIKE ? ESCAPE '\\'"
+                    " OR e.data LIKE ? ESCAPE '\\')))")
+            params += [like, like, like, like, like]
         sql += " ORDER BY COALESCE(updated_at,'') DESC LIMIT ? OFFSET ?"
         params += [int(limit), int(offset)]
         conn = self._connect()
         try:
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def session_events_page(
+        self, session_id: str, *, limit: int, offset: int,
+        kind: str | None = None,
+    ) -> list[dict]:
+        if kind is not None and kind not in EVENT_KINDS:
+            raise ValueError(f"unknown event kind: {kind}")
+        sql = "SELECT * FROM events WHERE session_id=?"
+        params: list = [session_id]
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY timestamp,rowid LIMIT ? OFFSET ?"
+        params += [int(limit), int(offset)]
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            out = []
+            for e in rows:
+                d = dict(e)
+                d["data"] = json.loads(d["data"])
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+    def search_events(
+        self, q: str, *, repo_id: str | None = None,
+        agent: str | None = None, limit: int = 50, offset: int = 0,
+    ) -> list[dict]:
+        if not isinstance(q, str) or not q.strip():
+            raise ValueError("search query must be a non-empty string")
+        if len(q) > 500:
+            raise ValueError("search query too long (max 500)")
+        if agent is not None and agent not in AGENTS:
+            raise ValueError(f"unknown agent: {agent}")
+        like = f"%{_like_esc(q.strip())}%"
+        sql = (
+            "SELECT e.session_id,s.repo_id,s.agent,s.title,"
+            "e.id AS event_id,e.kind,"
+            "substr(e.text,1,600) AS text,e.timestamp"
+            " FROM events e JOIN sessions s ON s.id=e.session_id"
+            " WHERE (e.text LIKE ? ESCAPE '\\'"
+            " OR e.data LIKE ? ESCAPE '\\'"
+            " OR s.title LIKE ? ESCAPE '\\')"
+        )
+        params: list = [like, like, like]
+        if repo_id:
+            sql += " AND s.repo_id=?"
+            params.append(repo_id)
+        if agent:
+            sql += " AND s.agent=?"
+            params.append(agent)
+        sql += " ORDER BY e.timestamp DESC,e.rowid DESC LIMIT ? OFFSET ?"
+        params += [int(limit), int(offset)]
+        conn = self._connect()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def repo_branches(self, repo_id: str) -> list[str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT branch FROM checkpoints WHERE repo_id=?"
+                " AND branch IS NOT NULL UNION SELECT DISTINCT branch"
+                " FROM sessions WHERE repo_id=? AND branch IS NOT NULL"
+                " ORDER BY branch",
+                (repo_id, repo_id),
+            ).fetchall()
+            return [r["branch"] for r in rows]
+        finally:
+            conn.close()
+
+    def child_sessions(self, session_id: str) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE parent_session_id=?"
+                " ORDER BY updated_at", (session_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def sessions_for_checkpoint(self, checkpoint_id: str) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT s.* FROM sessions s JOIN checkpoint_links l"
+                " ON l.session_id=s.id WHERE l.checkpoint_id=?"
+                " ORDER BY s.updated_at", (checkpoint_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def add_review(
+        self, checkpoint_id: str, author: str, body: str
+    ) -> dict:
+        if self.get_checkpoint(checkpoint_id) is None:
+            raise KeyError(checkpoint_id)
+        author = str(redact(author.strip()))[:80]
+        body = str(redact(body.strip()))[:10000]
+        if not author or not body:
+            raise ValueError("review requires non-empty author and body")
+        rid = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO reviews(id,checkpoint_id,author,body,"
+                "created_at) VALUES(?,?,?,?,?)",
+                (rid, checkpoint_id, author, body, now_iso()),
+            )
+            conn.commit()
+            return self._review_dict(rid)
+        finally:
+            conn.close()
+
+    def _review_dict(self, rid: str) -> dict:
+        conn = self._connect()
+        try:
+            r = conn.execute(
+                "SELECT * FROM reviews WHERE id=?", (rid,)
+            ).fetchone()
+            return dict(r)
+        finally:
+            conn.close()
+
+    def list_reviews(self, checkpoint_id: str) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM reviews WHERE checkpoint_id=?"
+                " ORDER BY created_at,id", (checkpoint_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
         finally:
             conn.close()
 
@@ -498,6 +743,16 @@ class Store:
             d["data"] = json.loads(d["data"])
             out.append(d)
         return out
+
+    def get_session_meta(self, session_id: str) -> dict | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def get_session(self, session_id: str) -> dict | None:
         conn = self._connect()
@@ -600,6 +855,7 @@ class Store:
         diff: str | None,
         links: list[tuple[str, str]],
         worktree: str | None,
+        created_at: str | None = None,
     ) -> dict:
         conn = self._connect()
         try:
@@ -620,7 +876,7 @@ class Store:
                         "session_ids) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             checkpoint_id, repo_id, commit_sha, branch,
-                            message, author, now_iso(),
+                            message, author, created_at or now_iso(),
                             canonical_json(files), diff, "[]",
                         ),
                     )
@@ -718,6 +974,7 @@ class Store:
                 seen.update(frontier)
                 sid_set.extend(frontier)
             sessions = self._session_public_rows(conn, sid_set)
+            roots = self._export_roots(conn, [cp["repo_id"]], sid_set)
             events = []
             if sid_set:
                 placeholders = ",".join("?" for _ in sid_set)
@@ -728,7 +985,9 @@ class Store:
                     " ORDER BY e.timestamp,e.rowid", sid_set,
                 ).fetchall()
                 events = [
-                    {**dict(e), "data": json.loads(e["data"])}
+                    {**dict(e),
+                     "data": _strip_event_paths(
+                         json.loads(e["data"]), roots)}
                     for e in rows
                 ]
             return {
@@ -775,6 +1034,8 @@ class Store:
                 checkpoints = conn.execute(
                     "SELECT * FROM checkpoints").fetchall()
             sess_ids = [s["id"] for s in sessions]
+            repo_ids = [r["id"] for r in repos]
+            roots = self._export_roots(conn, repo_ids, sess_ids)
             events = []
             if sess_ids:
                 placeholders = ",".join("?" for _ in sess_ids)
@@ -798,7 +1059,9 @@ class Store:
                 "repositories": [dict(r) for r in repos],
                 "sessions": [dict(s) for s in sessions],
                 "events": [
-                    {**dict(e), "data": json.loads(e["data"])}
+                    {**dict(e),
+                     "data": _strip_event_paths(
+                         json.loads(e["data"]), roots)}
                     for e in events
                 ],
                 "checkpoints": [
@@ -813,6 +1076,51 @@ class Store:
             }
         finally:
             conn.close()
+
+    def strip_paths(self, data: dict, repo_id: str | None) -> dict:
+        conn = self._connect()
+        try:
+            if repo_id:
+                roots = self._export_roots(conn, [repo_id], [])
+                rows = conn.execute(
+                    "SELECT DISTINCT worktree FROM sessions"
+                    " WHERE repo_id=? AND worktree IS NOT NULL",
+                    (repo_id,),
+                ).fetchall()
+                roots += [r["worktree"] for r in rows]
+            else:
+                roots = [
+                    r[0] for r in conn.execute(
+                        "SELECT root FROM repositories"
+                        " WHERE root IS NOT NULL")
+                ]
+        finally:
+            conn.close()
+        return _strip_event_paths(data, roots)
+
+    def _export_roots(
+        self, conn, repo_ids: list[str], sess_ids: list[str]
+    ) -> list[str]:
+        roots: list[str] = []
+        if repo_ids:
+            ph = ",".join("?" for _ in repo_ids)
+            roots += [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT root FROM repositories"
+                    f" WHERE root IS NOT NULL AND id IN ({ph})",
+                    repo_ids,
+                )
+            ]
+        if sess_ids:
+            ph = ",".join("?" for _ in sess_ids)
+            roots += [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT worktree FROM sessions"
+                    f" WHERE worktree IS NOT NULL AND id IN ({ph})",
+                    sess_ids,
+                )
+            ]
+        return [str(Path(r)) for r in roots]
 
     def import_bundle(self, bundle: dict) -> dict:
         if not isinstance(bundle, dict):
@@ -895,9 +1203,13 @@ class Store:
                         raise ValueError(
                             "session id does not match scoped"
                             " (repo,agent,native_id) identity")
-                    status = s.get("status") or "active"
-                    if status not in _SESSION_STATUSES:
-                        raise ValueError(f"invalid session status: {status}")
+                    status = s.get("status")
+                    if status is None:
+                        status = "active"
+                    if not isinstance(status, str) \
+                            or status not in _SESSION_STATUSES:
+                        raise ValueError(
+                            f"invalid session status: {status}")
                     started = _norm_ts_opt(
                         s.get("started_at"), "session started_at")
                     updated = _norm_ts_opt(
@@ -969,25 +1281,37 @@ class Store:
                         if k not in e:
                             raise ValueError(
                                 f"event missing required field: {k}")
+                    for k in ("id", "session_id", "agent", "kind",
+                              "timestamp"):
+                        if not isinstance(e[k], str) or not e[k]:
+                            raise ValueError(
+                                f"event field {k} must be a"
+                                " non-empty string")
+                    if "text" in e and not isinstance(e["text"], str):
+                        raise ValueError("event text must be a string")
+                    if "data" in e and not isinstance(e["data"], dict):
+                        raise ValueError(
+                            "event data must be an object")
+                    if e.get("tool_name") is not None and not isinstance(
+                            e["tool_name"], str):
+                        raise ValueError(
+                            "event tool_name must be a string")
                     target_sid = e["session_id"]
-                    if not isinstance(target_sid, str) or \
-                            target_sid not in session_repo:
+                    if target_sid not in session_repo:
                         raise ValueError(
                             "event references unknown session in bundle")
                     if e["agent"] != session_agent[target_sid]:
                         raise ValueError(
                             "event agent does not match target session")
                     evd = Event(
-                        id=str(e["id"]),
+                        id=e["id"],
                         session_id=target_sid,
                         agent=e["agent"],
-                        kind=str(e["kind"]),
+                        kind=e["kind"],
                         timestamp=e["timestamp"],
-                        text=e.get("text") if isinstance(
-                            e.get("text"), str) else "",
+                        text=e.get("text") or "",
                         tool_name=e.get("tool_name"),
-                        data=e.get("data")
-                        if isinstance(e.get("data"), dict) else {},
+                        data=e.get("data") or {},
                     )
                     validate_event(evd)
                     evd.data = redact(evd.data)

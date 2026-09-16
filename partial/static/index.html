@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partial — Context, committed.</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="landing">
+  <header>
+    <div class="logo"><img src="/static/favicon.svg" alt=""><span>Partial</span></div>
+    <div class="spacer"></div>
+    <a href="/app#/integrations">Docs</a>
+    <a class="button primary" href="/app">Open workspace</a>
+  </header>
+
+  <div class="lhero">
+    <div class="eyebrow">OPEN SOURCE · LOCAL FIRST</div>
+    <h1>Keep the context.<br>Not just the code.</h1>
+    <p class="lede">Partial records AI coding sessions — prompts, responses,
+      and tool activity from Devin, Codex, and Claude, plus ChatGPT exports —
+      and links them to Git commits as portable checkpoints stored on a
+      metadata ref. Your history stays on your machine, in SQLite, and on a
+      checkpoint branch you control.</p>
+    <div class="cta-row">
+      <a class="button primary" href="/app">Open the dashboard</a>
+      <a class="button" href="/app#/integrations">See integrations</a>
+    </div>
+  </div>
+
+  <section>
+    <div class="mockshot" aria-hidden="true">
+      <div class="mbar"><span></span><span></span><span></span></div>
+      <div class="mbody">
+        <div class="mside">
+          <i class="on"></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="mcontent">
+          <div class="mrow"><i class="mdot o"></i><i class="w46"></i></div>
+          <div class="mrow"><i class="mdot b"></i><i class="w70"></i></div>
+          <div class="mrow"><i class="mdot g"></i><i class="w58"></i></div>
+          <div class="mrow"><i class="mdot b"></i><i class="w34"></i></div>
+          <div class="mrow"><i class="mdot g"></i><i class="w62"></i></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How a session reads back</h2>
+    <div class="minitl">
+      <div class="lbl">Example</div>
+      <div class="mi"><span class="mk">prompt</span><span>Add cursor pagination to the activity feed.</span></div>
+      <div class="mi"><span class="mk">tool · edit</span><span><code>src/routes/activity.py</code> — limit = min(requested_limit, 100)</span></div>
+      <div class="mi"><span class="mk">response</span><span>The endpoint now returns a stable cursor and preserves the requested page size.</span></div>
+      <div class="mi"><span class="mk">checkpoint</span><span><code>a1b2c3d</code> linked to this session via observed-worktree-overlap</span></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="feat3">
+      <div class="feat">
+        <h3>Git-native checkpoints</h3>
+        <p>Commits are captured as checkpoints on a dedicated metadata ref —
+          never on your code branch — with diffs, linked sessions, and review
+          notes.</p>
+      </div>
+      <div class="feat">
+        <h3>Devin, included</h3>
+        <p>First-class hooks for Devin, plus Claude, Codex streaming capture,
+          and ChatGPT export import — all through one local CLI.</p>
+      </div>
+      <div class="feat">
+        <h3>Your data, your server</h3>
+        <p>Self-hosted single workspace. SQLite on disk, token-gated web UI,
+          no accounts, no telemetry, no runtime dependencies.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="num">01</div>
+        <h3>Enable</h3>
+        <p><code>partial enable</code> merges Partial's hook entries into your
+          repository's agent configuration without touching anything else.</p>
+      </div>
+      <div class="step">
+        <div class="num">02</div>
+        <h3>Capture</h3>
+        <p>Agent sessions stream into a local SQLite store — prompts,
+          responses, tool calls — with best-effort secret redaction.</p>
+      </div>
+      <div class="step">
+        <div class="num">03</div>
+        <h3>Review</h3>
+        <p>Each commit can carry a checkpoint linking the sessions that
+          touched its files. Browse, search, and annotate in the web UI.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>MIT licensed</span>
+    <a href="https://github.com/JBHoerter/Partial">Source</a>
+    <span>Independently implemented; inspired by Entire (MIT).</span>
+  </footer>
+</div>
+</body>
+</html>

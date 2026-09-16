@@ -402,6 +402,28 @@ class RemoteTests(unittest.TestCase):
         for raw, want in cases.items():
             self.assertEqual(normalize_remote(raw), want, raw)
 
+    def test_scp_forms_share_identity(self):
+        scp = "git@github.com:JBHoerter/Partial.git"
+        san = sanitize_remote(scp)
+        self.assertEqual(san, "ssh://github.com/JBHoerter/Partial.git")
+        want = "github.com/JBHoerter/Partial"
+        self.assertEqual(normalize_remote(scp), want)
+        self.assertEqual(normalize_remote(san), want)
+        self.assertEqual(
+            normalize_remote("https://github.com/JBHoerter/Partial.git"),
+            want)
+        self.assertEqual(
+            normalize_remote("ssh://git@github.com:22/JBHoerter/"
+                             "Partial.git"), want)
+        self.assertEqual(
+            normalize_remote("github.com:JBHoerter/Partial.git"), want)
+
+    def test_local_paths_not_mistaken_for_scp(self):
+        self.assertEqual(
+            normalize_remote("/home/x/repo"), "home/x/repo")
+        self.assertEqual(
+            normalize_remote("C:\\code\\repo"), "\\code\\repo")
+
     def test_sanitize_remote_strips_credentials(self):
         out = sanitize_remote("https://user:secret@example.com/r.git?tok=1")
         self.assertNotIn("secret", out)

@@ -83,7 +83,8 @@ def discover_repo(path: str | Path = ".") -> dict:
         path, "rev-parse", "--path-format=absolute", "--git-common-dir"
     ).strip()
     proc = _git(path, "remote", "get-url", "origin", check=False)
-    remote = proc.stdout.decode().strip() if proc.returncode == 0 else ""
+    remote_raw = proc.stdout.decode().strip() if proc.returncode == 0 \
+        else ""
     proc = _git(path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
     branch = proc.stdout.decode().strip() if proc.returncode == 0 else ""
     if branch == "HEAD":
@@ -92,7 +93,8 @@ def discover_repo(path: str | Path = ".") -> dict:
         "root": root,
         "git_dir": git_dir,
         "common_dir": common,
-        "remote": sanitize_remote(remote),
+        "remote": sanitize_remote(remote_raw),
+        "id": repo_id_for(root, common, remote_raw),
         "name": Path(root).name,
         "branch": branch,
         "worktree": root,
@@ -100,6 +102,8 @@ def discover_repo(path: str | Path = ".") -> dict:
 
 
 def repo_id_for_repo(repo: dict) -> str:
+    if repo.get("id"):
+        return repo["id"]
     return repo_id_for(repo["root"], repo["common_dir"], repo["remote"])
 
 
@@ -281,11 +285,21 @@ def _hooks_v1_path(repo: dict) -> Path:
     return Path(repo["root"]) / ".devin" / "hooks.v1.json"
 
 
+_HOOK_EVENT_KEYS = frozenset(DEVIN_HOOK_EVENTS) | frozenset(
+    CLAUDE_HOOK_EVENTS)
+_HOOK_FIELD_BY_TYPE = {"command": "command", "prompt": "prompt",
+                       "http": "url", "url": "url"}
+
+
 def _validate_hook_groups(data: object, ctx: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"{ctx}: expected a JSON object")
     for key, entries in data.items():
         if not isinstance(entries, list):
+            if key in _HOOK_EVENT_KEYS:
+                raise ValueError(
+                    f"{ctx}: entry for {key!r} is not a"
+                    " matcher/hooks group list")
             continue
         for g in entries:
             if not isinstance(g, dict) or not isinstance(
@@ -294,10 +308,23 @@ def _validate_hook_groups(data: object, ctx: str) -> dict:
                     f"{ctx}: entry for {key!r} is not a matcher/hooks"
                     " group")
             for h in g["hooks"]:
-                if not isinstance(h, dict) or not isinstance(
-                        h.get("command"), str):
+                if not isinstance(h, dict):
                     raise ValueError(
-                        f"{ctx}: hook entry for {key!r} lacks a command")
+                        f"{ctx}: hook entry for {key!r} is not an"
+                        " object")
+                htype = h.get("type")
+                field = _HOOK_FIELD_BY_TYPE.get(htype)
+                if field is not None:
+                    if not isinstance(h.get(field), str):
+                        raise ValueError(
+                            f"{ctx}: {htype} hook for {key!r} lacks a"
+                            f" {field} string")
+                elif not any(
+                        isinstance(h.get(f), str)
+                        for f in ("command", "prompt", "url")):
+                    raise ValueError(
+                        f"{ctx}: hook entry for {key!r} lacks a"
+                        " command, prompt, or url")
     return data
 
 
@@ -542,18 +569,120 @@ def persist_checkpoint(repo: dict, bundle: dict, checkpoint_id: str) -> str:
         index.unlink(missing_ok=True)
 
 
-def _import_checkpoint_file(store: Store, raw: str) -> str | None:
+_BUNDLE_NAME_RE = re.compile(
+    r"checkpoints/[0-9a-f]{32}\.json")
+_PULL_CAP = 64 * 1024 * 1024
+
+
+def _validate_remote_name(root: str, remote: str) -> None:
+    if not remote or remote.startswith("-") or "://" in remote \
+            or "/" in remote:
+        raise GitError(f"invalid remote name: {remote!r}")
+    remotes = _git_out(root, "remote").split()
+    if remote not in remotes:
+        raise GitError(
+            f"remote {remote!r} is not configured in this repository")
+
+
+def _list_bundle_blobs(root: str, ref: str) -> dict[str, str]:
+    out = _git_out(root, "ls-tree", "-r", "-l", ref)
+    blobs: dict[str, str] = {}
+    total = 0
+    for line in out.splitlines():
+        meta, sep, name = line.partition("\t")
+        parts = meta.split()
+        if not sep or len(parts) != 4 or parts[1] != "blob":
+            raise GitError(
+                f"{ref}: unexpected non-blob entry in metadata tree")
+        size_s = parts[3]
+        if not _BUNDLE_NAME_RE.fullmatch(name):
+            raise GitError(f"{ref}: unexpected entry {name!r}")
+        if not size_s.isdigit():
+            raise GitError(f"{ref}: invalid blob size for {name!r}")
+        size = int(size_s)
+        total += size
+        if size > _PULL_CAP or total > _PULL_CAP:
+            raise GitError(f"{ref}: metadata tree exceeds 64 MiB")
+        blobs[name] = _git_out(root, "show", f"{ref}:{name}")
+    return blobs
+
+
+def _validate_bundles_for_repo(blobs: dict[str, str], repo_id: str
+                               ) -> dict[str, dict]:
+    bundles: dict[str, dict] = {}
+    for name, raw in blobs.items():
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            raise GitError(f"{name}: invalid JSON checkpoint bundle")
+        if not isinstance(obj, dict) or obj.get("version") != 1:
+            raise GitError(f"{name}: not a version-1 checkpoint bundle")
+        for section in ("repositories", "sessions", "checkpoints"):
+            entries = obj.get(section)
+            if not isinstance(entries, list):
+                raise GitError(
+                    f"{name}: bundle {section} must be a list")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise GitError(f"{name}: malformed {section} entry")
+                key = "id" if section == "repositories" else "repo_id"
+                if entry.get(key) != repo_id:
+                    raise GitError(
+                        f"{name}: bundle belongs to a different"
+                        " repository")
+        cps = obj["checkpoints"]
+        if len(cps) != 1 or cps[0].get("id") != Path(name).stem:
+            raise GitError(
+                f"{name}: checkpoint id does not match bundle path")
+        bundles[name] = obj
+    return bundles
+
+
+def _merge_metadata(store: Store, repo: dict, local: str, fetched: str,
+                    remote_names: set[str]) -> str:
+    root = repo["root"]
+    state = _state_dir(repo)
+    index = state / f"index-{uuid.uuid4().hex}"
+    env = _internal_env(index)
     try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return "invalid JSON checkpoint file"
-    if not isinstance(obj, dict):
-        return "checkpoint file is not a JSON object"
-    try:
-        store.import_bundle(obj)
-    except ValueError as exc:
-        return str(exc)
-    return None
+        for _ in range(4):
+            base = _ref_value(root, METADATA_REF)
+            if not base:
+                raise GitError(
+                    f"{METADATA_REF} disappeared during merge")
+            _git(root, "read-tree", base, env=env)
+            local_names = set(_git_out(
+                root, "ls-tree", "-r", "--name-only", base,
+            ).split())
+            for name in sorted(local_names | remote_names):
+                cpid = name.split("/", 1)[1][:-5]
+                bundle = store.checkpoint_bundle(cpid)
+                payload = canonical_json(bundle).encode("utf-8")
+                blob = _git(
+                    root, "hash-object", "-w", "--stdin",
+                    input_bytes=payload, env=env,
+                ).stdout.decode().strip()
+                _git(
+                    root, "update-index", "--add", "--cacheinfo",
+                    f"100644,{blob},{name}", env=env,
+                )
+            tree = _git(root, "write-tree",
+                        env=env).stdout.decode().strip()
+            commit = _git(
+                root, "commit-tree", tree, "-p", base, "-p", fetched,
+                "-m", "Merge Partial checkpoint context",
+                env=env,
+            ).stdout.decode().strip()
+            proc = _git(
+                root, "update-ref", METADATA_REF, commit, base,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return commit
+        raise GitError(
+            f"could not update {METADATA_REF}: concurrent modifications")
+    finally:
+        index.unlink(missing_ok=True)
 
 
 def sync_checkpoints(
@@ -565,25 +694,11 @@ def sync_checkpoints(
     remote: str = "origin",
 ) -> dict:
     root = repo["root"]
+    _validate_remote_name(root, remote)
     result = {
         "pushed": False, "pulled": 0, "import_errors": [],
-        "diverged": False, "error": None,
+        "diverged": False, "merged": False, "error": None,
     }
-    if push:
-        if not _ref_value(root, METADATA_REF):
-            result["error"] = f"no local {METADATA_REF} to push"
-            return result
-        proc = _git(
-            root, "push", remote, f"{METADATA_REF}:{METADATA_REF}",
-            check=False, timeout=60,
-        )
-        if proc.returncode != 0:
-            result["error"] = (
-                "push of metadata branch refused (diverged?): "
-                + str(redact(
-                    proc.stderr.decode("utf-8", "replace").strip())))
-            return result
-        result["pushed"] = True
     if pull:
         private = f"refs/partial/remotes/{remote}/checkpoints-v1"
         proc = _git(
@@ -600,36 +715,69 @@ def sync_checkpoints(
         if not fetched:
             result["error"] = "remote has no metadata branch"
             return result
+        rid = repo_id_for_repo(repo)
+        try:
+            remote_blobs = _list_bundle_blobs(root, fetched)
+            remote_bundles = _validate_bundles_for_repo(
+                remote_blobs, rid)
+        except GitError as exc:
+            result["error"] = str(exc)
+            return result
+        for name, bundle in remote_bundles.items():
+            try:
+                store.import_bundle(bundle)
+                result["pulled"] += 1
+            except ValueError as exc:
+                result["error"] = f"{name}: {exc}"
+                return result
         local = _ref_value(root, METADATA_REF)
-        if local and local != fetched:
-            anc = _git(root, "merge-base", "--is-ancestor", local, fetched,
-                       check=False)
+        if not local or local == fetched:
+            if not local:
+                _git(root, "update-ref", METADATA_REF, fetched)
+        else:
+            anc = _git(root, "merge-base", "--is-ancestor", local,
+                       fetched, check=False)
             if anc.returncode == 0:
                 _git(root, "update-ref", METADATA_REF, fetched, local)
             else:
-                anc2 = _git(root, "merge-base", "--is-ancestor", fetched,
-                            local, check=False)
+                anc2 = _git(root, "merge-base", "--is-ancestor",
+                            fetched, local, check=False)
                 if anc2.returncode != 0:
                     result["diverged"] = True
-        elif not local:
-            _git(root, "update-ref", METADATA_REF, fetched)
-        names = _git_out(
-            root, "ls-tree", "-r", "--name-only", fetched,
-        ).splitlines()
-        for name in names:
-            name = name.strip()
-            if not name.startswith(CHECKPOINT_DIR + "/") or \
-                    not name.endswith(".json"):
-                continue
-            raw = _git_out(root, "show", f"{fetched}:{name}")
-            err = _import_checkpoint_file(store, raw)
-            if err:
-                result["import_errors"].append(f"{name}: {err}")
-            else:
-                result["pulled"] += 1
-        if result["diverged"]:
+                    try:
+                        local_blobs = _list_bundle_blobs(root, local)
+                        local_bundles = _validate_bundles_for_repo(
+                            local_blobs, rid)
+                    except GitError as exc:
+                        result["error"] = str(exc)
+                        return result
+                    for name, bundle in local_bundles.items():
+                        try:
+                            store.import_bundle(bundle)
+                        except ValueError as exc:
+                            result["error"] = f"{name}: {exc}"
+                            return result
+                    try:
+                        _merge_metadata(
+                            store, repo, local, fetched,
+                            set(remote_blobs))
+                    except (GitError, ValueError) as exc:
+                        result["error"] = str(exc)
+                        return result
+                    result["merged"] = True
+    if push:
+        if not _ref_value(root, METADATA_REF):
+            result["error"] = f"no local {METADATA_REF} to push"
+            return result
+        proc = _git(
+            root, "push", remote, f"{METADATA_REF}:{METADATA_REF}",
+            check=False, timeout=60,
+        )
+        if proc.returncode != 0:
             result["error"] = (
-                "local and remote metadata branches have diverged;"
-                " checkpoint bundles were imported but refs were left"
-                " untouched")
+                "push of metadata branch refused (diverged?): "
+                + str(redact(
+                    proc.stderr.decode("utf-8", "replace").strip())))
+            return result
+        result["pushed"] = True
     return result

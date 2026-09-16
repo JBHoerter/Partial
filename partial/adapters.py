@@ -427,11 +427,28 @@ def _codex_rollout_event(obj: dict, sid: str, i: int) -> list[Event]:
     return []
 
 
-def _namespace_codex(ev: Event, sid: str, turn: int, seq: int) -> None:
-    base = ev.id
-    if base.startswith(sid + ":"):
-        base = base[len(sid) + 1:]
-    ev.id = f"{sid}:t{turn}:l{seq}:{base}"
+def _codex_line_key(payload: dict, seq: int) -> str:
+    if payload.get("type") == "item.completed":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("id"):
+            return f"item:{item['id']}"
+    if payload.get("type") == "thread.started":
+        return "thread.started"
+    return f"line:{seq}"
+
+
+def namespace_codex_events(
+    evs: list[Event], payload: dict, *, sid: str,
+    turn: int, seq: int, run: str | None = None,
+) -> list[Event]:
+    key = _codex_line_key(payload, seq)
+    for ev in evs:
+        ev.session_id = sid
+        ev.id = sha256_hex(
+            "codex/ev/v1\x00" + (run or "")
+            + f"\x00{sid}\x00t{turn}\x00{key}\x00{ev.id}"
+        )
+    return evs
 
 
 def _import_codex(lines: list[tuple[int, dict]],
@@ -453,10 +470,8 @@ def _import_codex(lines: list[tuple[int, dict]],
         if obj.get("type") in ("event_msg", "response_item"):
             out.extend(_codex_rollout_event(obj, sid, i))
         else:
-            for ev in codex_event(obj, sid):
-                ev.session_id = sid
-                _namespace_codex(ev, sid, turn, i)
-                out.append(ev)
+            out.extend(namespace_codex_events(
+                codex_event(obj, sid), obj, sid=sid, turn=turn, seq=i))
     return out
 
 

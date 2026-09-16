@@ -143,9 +143,9 @@ class CodexImportTests(unittest.TestCase):
         self.assertIn("usage", kinds)
         self.assertNotIn("secret chain", json.dumps(
             [e.to_dict() for e in evs]))
-        dup_ids = [e.id for e in evs if e.id.endswith(":item:i1")]
-        self.assertEqual(len(dup_ids), 2)
-        self.assertEqual(len(set(dup_ids)), 2)
+        items = [e for e in evs if e.text == "on it"]
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].id, items[1].id)
         again = parse_import("codex", dup)
         self.assertEqual([e.id for e in evs], [e.id for e in again])
         self.assertTrue(all(e.session_id == "thr_1" for e in evs))
@@ -172,10 +172,10 @@ class CodexImportTests(unittest.TestCase):
         usage = [e.id for e in evs if e.kind == "usage"]
         self.assertEqual(len(usage), 2)
         self.assertNotEqual(usage[0], usage[1])
-        items = [e.id for e in evs if "item_1" in e.id]
-        self.assertEqual(len(set(items)), 2)
         texts = [e.text for e in evs if e.kind == "response"]
         self.assertEqual(texts, ["a", "b"])
+        self.assertNotEqual(
+            *[e.id for e in evs if e.kind == "response"])
 
     def test_rollout_formats(self):
         lines = [
