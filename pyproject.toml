@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "partial"
 version = "0.1.0"
 description = "Local-first AI session tracker with git commit checkpoints"
-readme = "AGENTS.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = []
